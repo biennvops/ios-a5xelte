@@ -15,6 +15,9 @@ import mkadt
 
 DRAM_BASE = 0x90000000      # isolated XNU window, free in the herolte DTB
 DRAM_SIZE = 0x20000000      # 512 MiB, ends below TIMA at 0xb1000000
+# --bank2: the second DRAM bank (DTB memory@880000000), 2 GiB with no
+# reserved-memory node in it; needs the bank-aware shim/herolte loader.
+BANK2_BASE, BANK2_SIZE = 0x880000000, 0x80000000
 SOC_BASE = 0x10000000       # arm-io ranges base; child regs are relative
 FB_BASE, FB_WIDTH, FB_HEIGHT = 0xe2a00000, 1440, 2560
 
@@ -34,7 +37,7 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT)):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE)):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # The userland is the iPhone X IPSW (iPhone10,3 / D22AP), like the donor:
     # compatible[0] is hw.model/hw.target, model is hw.machine. The donor's
@@ -44,8 +47,8 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT)):
              mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,herolte') +
              mkadt.cstr('samsung,exynos8890') + mkadt.cstr('AppleARM'))
     chosen = child(root, 'chosen')
-    set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
-    set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
+    set_prop(chosen, 'dram-base', mkadt.u64(dram[0]))
+    set_prop(chosen, 'dram-size', mkadt.u64(dram[1]))
     set_prop(chosen, 'firmware-version', mkadt.cstr('herolte-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('herolte-entry'))
     # MobileGestalt derives the UDID from these; without them it waits for a
@@ -135,8 +138,11 @@ if __name__ == '__main__':
     parser.add_argument('output', type=Path)
     parser.add_argument('--canvas', default=f'{FB_WIDTH}x{FB_HEIGHT}',
                         help='presented display WxH (960x1706 with sweetfb_scale=1)')
+    parser.add_argument('--bank2', action='store_true',
+                        help='XNU RAM = the 2 GiB second bank instead of the 512 MiB window')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
-    blob = adt.serialize(build(canvas))
+    dram = (BANK2_BASE, BANK2_SIZE) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
+    blob = adt.serialize(build(canvas, dram))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')
