@@ -48,6 +48,12 @@ def build():
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
     set_prop(chosen, 'firmware-version', mkadt.cstr('herolte-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('herolte-entry'))
+    # MobileGestalt derives the UDID from these; without them it waits for a
+    # Bluetooth/Wi-Fi driver forever, and LaunchServices never finishes seeding
+    # the app database (SpringBoard stays on the boot logo). Synthetic,
+    # locally administered addresses, not the phone's.
+    for name, last in (('wifi0', 1), ('bluetooth0', 2), ('ethernet0', 3)):
+        set_prop(chosen, f'mac-address-{name}', bytes((0x02, 0x48, 0x45, 0x52, 0x4f, last)))
     cpus = child(root, 'cpus')
     cpu0 = child(cpus, 'cpu0')
     # S-Boot starts on the Cortex-A53 "Apollo" cluster: MPIDR 0x100..0x103
