@@ -34,7 +34,7 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build():
+def build(canvas=(FB_WIDTH, FB_HEIGHT)):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # The userland is the iPhone X IPSW (iPhone10,3 / D22AP), like the donor:
     # compatible[0] is hw.model/hw.target, model is hw.machine. The donor's
@@ -106,8 +106,11 @@ def build():
         # in KernelConfigTables.cpp; without it SpringBoard sees no main display.
         ('compatible', mkadt.cstr('samsung,a5xelte-display') +
          mkadt.cstr('samsung,herolte-display')),
-        ('canvas-width', mkadt.u32(FB_WIDTH)),
-        ('canvas-height', mkadt.u32(FB_HEIGHT)),
+        # MobileGestalt's main-screen size: backboardd sizes its surfaces
+        # from it, not from the framebuffer's GetDisplaySize. With
+        # sweetfb_scale=1 it must be the scaled 960x1706 (--canvas).
+        ('canvas-width', mkadt.u32(canvas[0])),
+        ('canvas-height', mkadt.u32(canvas[1])),
     ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
@@ -130,7 +133,10 @@ def build():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--canvas', default=f'{FB_WIDTH}x{FB_HEIGHT}',
+                        help='presented display WxH (960x1706 with sweetfb_scale=1)')
     args = parser.parse_args()
-    blob = adt.serialize(build())
+    canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
+    blob = adt.serialize(build(canvas))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')
