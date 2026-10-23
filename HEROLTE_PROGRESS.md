@@ -222,4 +222,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
 - `0217`: reintentos de lectura como `sec_ts_i2c_read()` (hasta 10),
   contadores `moves/i2c_retries/lost_reads`; las pausas de 11 s solo con
   `herotouchslow=1` (el táctil queda listo a los pocos segundos).
+- **0217 en el teléfono:** `moves=835 i2c_retries=6 lost_reads=0`: los
+  movimientos llegan completos; el gesto en "Hola" no avanza porque Setup
+  espera CoreTelephony/activación (igual que el donor).
+- **🏠 Pantalla de inicio de iOS (2026-10-23):** imagen con Setup marcado
+  como completo (imagen `035edb65…d60a`, flasheo diferencial de 155
+  bloques): pantalla de inicio y Centro de control con el táctil. Sin apps
+  (el staging excluía `/Applications`; dos iconos "Waiting…") y muy lento.
+- `STAGE_ALL_APPS=1` en `ios-root` (todas las apps, ~215 MiB) y `0218` +
+  ADT `cpu4..7`: los 4 Mongoose (MPIDR `0x0..0x3`) como lógicos 4–7 con
+  `cpus=8`.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
