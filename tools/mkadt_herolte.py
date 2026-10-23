@@ -50,26 +50,31 @@ def build():
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('herolte-entry'))
     cpus = child(root, 'cpus')
     cpu0 = child(cpus, 'cpu0')
-    # S-Boot starts on the Cortex-A53 "Apollo" cluster: MPIDR 0x100..0x103.
-    # The Mongoose cluster (MPIDR 0..3) is left out until SMP works.
+    # S-Boot starts on the Cortex-A53 "Apollo" cluster: MPIDR 0x100..0x103
+    # (logical 0..3); the Mongoose cluster, MPIDR 0..3, is logical 4..7.
+    # One XNU cluster (homogeneous SMP); separate L2 ids. cpus=4 keeps the
+    # A53s only.
     set_prop(cpu0, 'compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8'))
     set_prop(cpu0, 'reg', mkadt.u32(0x100))
     set_prop(cpu0, 'timebase-frequency', mkadt.u32(26000000))
-    for logical in range(1, 4):
+    for logical in range(1, 8):
+        mongoose = logical >= 4
+        core = logical - 4 if mongoose else logical
         cpus.children.append(mkadt.node(f'cpu{logical}', [
             ('device_type', mkadt.cstr('cpu')),
-            ('compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
-            ('reg', mkadt.u32(0x100 | logical)),
+            ('compatible', (mkadt.cstr('samsung,mongoose') if mongoose else
+                            mkadt.cstr('arm,cortex-a53')) + mkadt.cstr('ARM,v8')),
+            ('reg', mkadt.u32(core if mongoose else 0x100 | core)),
             ('cpu-id', mkadt.u32(logical)),
             ('cluster-id', mkadt.u32(0)),
             ('cluster-type', mkadt.u32(0)),
             ('die-cluster-id', mkadt.u32(0)),
             ('cluster-core-id', mkadt.u32(logical)),
-            ('l2-cache-id', mkadt.u32(0)),
+            ('l2-cache-id', mkadt.u32(1 if mongoose else 0)),
             ('l3-cache-id', mkadt.u32(0)),
             ('state', mkadt.cstr('stopped')),
             ('timebase-frequency', mkadt.u32(26000000)),
-            ('clock-frequency', mkadt.u32(1586000000)),
+            ('clock-frequency', mkadt.u32(2600000000 if mongoose else 1586000000)),
             ('bus-frequency', mkadt.u32(100000000)),
             ('memory-frequency', mkadt.u32(1794000000)),
             ('peripheral-frequency', mkadt.u32(26000000)),
