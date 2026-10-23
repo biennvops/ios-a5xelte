@@ -243,4 +243,13 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   sintéticas en el ADT (`02:48:45:52:4f:0x`): **pantalla de inicio con
   iconos** (Fotos, App Store, Ajustes, Teléfono, Safari, Mensajes) y
   Ajustes > Información abre ("iPhone X", iOS 16.7.16, 21 GB).
+- **Batería (0220/0221):** el fuel gauge es el del MAX77854 (`0x36` en
+  HSI2C_1 `0x13650000`, pines GPD1-2/3; en HSI2C_0 no hay ACK). Lecturas
+  reales en el teléfono: 100 %, 4339 mV, +114 mA con cargador; 4043 mV,
+  −749 mA sin él; FULLCAP ≈ 2000 mAh. iOS muestra 100 % → 99 %.
+- **Botón de encendido (0220):** con `a5fb_keep_on` se acepta el apagado de
+  pantalla si llega < 3 s después de pulsar Power; bloquea y apaga la
+  pantalla, y vuelve con la pantalla de bloqueo.
+- `0222`: `sweetfb_scale=1` experimental, iOS dibuja 960x1706 y el kernel
+  escala x1.5 (menos píxeles para el renderizado por CPU).
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
