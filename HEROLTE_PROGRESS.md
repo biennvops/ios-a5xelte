@@ -232,4 +232,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
 - `STAGE_ALL_APPS=1` en `ios-root` (todas las apps, ~215 MiB) y `0218` +
   ADT `cpu4..7`: los 4 Mongoose (MPIDR `0x0..0x3`) como lógicos 4–7 con
   `cpus=8`.
+- **8 núcleos (ADT con `arm,cortex-a53` también en los Mongoose):**
+  `8/8 CPUs initialized`; `0219` confirma contador común a los dos clusters
+  (lag < 1 ms) y temporizadores que despiertan en los 8 (21 ms sobre 20).
+  Los Mongoose reportan `midr=0x531f0011`, `ctr=0x84448005` (línea de
+  I-cache de 128 B frente a 64 B en los A53).
+- Con todas las apps se quedaba en el logo: `lsd` no terminaba de sembrar la
+  base de LaunchServices porque MobileGestalt calculaba el UDID y esperaba
+  para siempre `mac-address-bluetooth0` (no estaba en `/chosen`). Con MACs
+  sintéticas en el ADT (`02:48:45:52:4f:0x`): **pantalla de inicio con
+  iconos** (Fotos, App Store, Ajustes, Teléfono, Safari, Mensajes) y
+  Ajustes > Información abre ("iPhone X", iOS 16.7.16, 21 GB).
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
