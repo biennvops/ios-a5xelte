@@ -62,8 +62,9 @@ def build():
         core = logical - 4 if mongoose else logical
         cpus.children.append(mkadt.node(f'cpu{logical}', [
             ('device_type', mkadt.cstr('cpu')),
-            ('compatible', (mkadt.cstr('samsung,mongoose') if mongoose else
-                            mkadt.cstr('arm,cortex-a53')) + mkadt.cstr('ARM,v8')),
+            # SweetCPU matches IONameMatch 'arm,cortex-a53' (KernelConfigTables).
+            ('compatible', (mkadt.cstr('samsung,mongoose') if mongoose else b'') +
+                           mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
             ('reg', mkadt.u32(core if mongoose else 0x100 | core)),
             ('cpu-id', mkadt.u32(logical)),
             ('cluster-id', mkadt.u32(0)),
