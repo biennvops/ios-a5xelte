@@ -46,6 +46,11 @@ for app in "${ui_apps[@]}"; do
     app_filters+=("--include=/Applications/$app.app/***")
 done
 app_filters+=('--exclude=/Applications/***')
+# STAGE_ALL_APPS=1 keeps every stock app (Settings, Photos, ...; about
+# 215 MiB): the HEROLTE root has room for them.
+if [[ ${STAGE_ALL_APPS:-0} == 1 ]]; then
+    app_filters=()
+fi
 # Other omitted asset families are not proven optional for every feature.
 omit=(
     '--exclude=/System/Library/LinguisticData/***'
