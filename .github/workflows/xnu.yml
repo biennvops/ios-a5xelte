@@ -110,7 +110,12 @@ jobs:
           lines = open(sys.argv[1], errors='replace').read().splitlines()
           clean = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
           pat = re.compile(r'(error:|fatal error|Error \d|\*\*\* |FAILED|Skipping patch|No such file|panic|❌)', re.I)
-          hits = [l for l in clean if pat.search(l)]
+          # Compiler/linker errors first: blacktop's known patch-skip lines
+          # come first in the log and used to fill every annotation.
+          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: |Undefined symbols|clang: error)')
+          hits = [l for l in clean if cc.search(l)]
+          hits += [l for l in clean if pat.search(l) and l not in hits and 'Skipping patch' not in l
+                   and 'already exists in working directory' not in l and 'patch does not apply' not in l]
           esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
           for l in hits[:9]:
               print('::error title=build::' + esc(l[:900]))
