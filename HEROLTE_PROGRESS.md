@@ -274,6 +274,13 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   tiler encendidos (ready `0x1`) y **primer trabajo en la GPU**:
   `WRITE_VALUE` en JS1/AS0 con `irq=0x2 mmu=0 exception=1 output=0`, sin
   fallos y sin afectar a iOS.
+- **🎨 La GPU dibuja (0227–0230, 2026-10-24):** el descriptor simple de la
+  T720 (SFBD) da `DATA_INVALID_FAULT`; con el multi-target de Mesa v5
+  (MFBD) y el tiler "desactivado con jerarquía" (máscara 4096, cabecera de
+  512 bytes) el fragment job escribe **256/256 píxeles** en memoria
+  privada, y con `herogpu=6` **pinta toda la pantalla 1440x2560 de verde
+  en 16.6 ms con un solo shader core** (foto del usuario). La copia de iOS
+  se pausa 8 s (`sweet_fb_hold_until`) para que se vea.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
