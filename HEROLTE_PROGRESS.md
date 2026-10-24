@@ -260,6 +260,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   entrada > 4 GiB) y `0223` entra por un trampolín en `0x8fffe000`:
   **1 GiB y 8/8 núcleos**, pantalla de inicio "bastante más fluida, abre
   todo mucho más rápido".
+- **0224:** copia a pantalla en paralelo (3 hilos ayudantes): de 10–20 ms a
+  ~5 ms por cuadro, hasta 16 fps con movimiento. El log de `kmem` mostró
+  por qué 2 GiB no entraba: el kernel (configuración macOS) reserva un
+  compresor de 16 × RAM; `vm_compression_limit` lo limita. Con 2 GiB pasa
+  ese punto pero entra en pánico en `write_pte_fast` (PTE no alineada,
+  páginas de 16 KiB sobre 4 KiB). **Configuración actual: `--bank2
+  --bank2-mb 1536`, `vm_compression_limit=98304`, `cpus=8`: 1.5 GiB,
+  arranca.**
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
