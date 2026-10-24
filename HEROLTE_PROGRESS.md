@@ -290,6 +290,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   GPU frames dibujados por la CPU no compensa: la aceleración real pasa
   por shaders (primero un triángulo) y, a la larga, por traducir lo que
   pide CoreAnimation/Metal.
+- **0232/0233: primer dibujo 3D, un triángulo con shader** (foto del
+  usuario). Un tiler job (JS1) guarda el triángulo en la lista de
+  polígonos (cabecera 32 palabras, cuerpo 48) y un fragment job (JS0)
+  limpia la pantalla y ejecuta un shader Midgard de un bundle, ensamblado
+  a mano (`tools/herolte-midgard-shader.py`). Todo en 16 ms. En 0232 no
+  se veía nada porque el alpha test fijo de Midgard quedó en NEVER; con
+  ALWAYS (0233) el triángulo aparece. Sale casi negro (`02020202`): el
+  shader escribe r0 como fp32, y las constantes fp16 1.0 se leen como
+  ~0.008. Siguiente: texturas → escalado por GPU (iOS a 720p).
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
