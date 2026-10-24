@@ -299,6 +299,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   ALWAYS (0233) el triángulo aparece. Sale casi negro (`02020202`): el
   shader escribe r0 como fp32, y las constantes fp16 1.0 se leen como
   ~0.008. Siguiente: texturas → escalado por GPU (iOS a 720p).
+- **0234: primera textura, escalado por GPU** (`herogpu=9`, foto del
+  usuario). Una imagen de 180x320 se dibuja como un quad de pantalla
+  completa con filtro bilineal: la GPU la agranda 8x a 1440x2560. Sin
+  vertex shader, como el preload de Mesa: un varying con coordenadas de
+  texel sin normalizar. Shader de 4 bundles ensamblado a mano (ld_vary,
+  imov a r28, textura, writeout). Los píxeles leídos coinciden con sus
+  texels, y en el borde de un cuadro sale la mezcla del filtro.
+  **3.26 ms con los 12 cores** (34 ms con uno). Siguiente: que iOS
+  dibuje a 720x1280 y la GPU escale cada frame a la pantalla.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
