@@ -281,6 +281,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   privada, y con `herogpu=6` **pinta toda la pantalla 1440x2560 de verde
   en 16.6 ms con un solo shader core** (foto del usuario). La copia de iOS
   se pausa 8 s (`sweet_fb_hold_until`) para que se vea.
+- **0231:** los **12 shader cores** (`0xff0f`) encienden con la tensión de
+  S-Boot y pintan la pantalla entera en **3.26 ms** (5× más que un núcleo),
+  estable. `COHERENCY_FEATURES=0`: la GPU no ve las cachés de la CPU, así
+  que leer una superficie de iOS exige limpiarla antes (3.8 ms, un núcleo).
+  La copia por "preload" del render target da `DATA_INVALID_FAULT`; Mesa
+  no usa preload en Midgard (copia con un fragment shader). Copiar con la
+  GPU frames dibujados por la CPU no compensa: la aceleración real pasa
+  por shaders (primero un triángulo) y, a la larga, por traducir lo que
+  pide CoreAnimation/Metal.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
