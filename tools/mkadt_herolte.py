@@ -139,10 +139,12 @@ if __name__ == '__main__':
     parser.add_argument('--canvas', default=f'{FB_WIDTH}x{FB_HEIGHT}',
                         help='presented display WxH (960x1706 with sweetfb_scale=1)')
     parser.add_argument('--bank2', action='store_true',
-                        help='XNU RAM = the 2 GiB second bank instead of the 512 MiB window')
+                        help='XNU RAM = the second bank instead of the 512 MiB window')
+    parser.add_argument('--bank2-mb', type=int, default=BANK2_SIZE >> 20,
+                        help='MiB of the second bank to use (2048 panics in kmem_range_init)')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
-    dram = (BANK2_BASE, BANK2_SIZE) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
+    dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
     blob = adt.serialize(build(canvas, dram))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')
