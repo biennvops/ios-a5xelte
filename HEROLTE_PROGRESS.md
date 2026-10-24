@@ -268,6 +268,12 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   páginas de 16 KiB sobre 4 KiB). **Configuración actual: `--bank2
   --bank2-mb 1536`, `vm_compression_limit=98304`, `cpus=8`: 1.5 GiB,
   arranca.**
+- **GPU Mali-T880 (0225/0226):** el dominio G3D y los relojes ya vienen
+  encendidos de S-Boot; `GPU_ID=0x08802000` (Mali-T880 r2p0), 12 shader
+  cores (`0xff0f`), 1 tiler, 1 L2. Con `herogpu=3`: L2, shader core 0 y
+  tiler encendidos (ready `0x1`) y **primer trabajo en la GPU**:
+  `WRITE_VALUE` en JS1/AS0 con `irq=0x2 mmu=0 exception=1 output=0`, sin
+  fallos y sin afectar a iOS.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
