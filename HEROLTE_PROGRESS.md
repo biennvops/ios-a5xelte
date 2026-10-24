@@ -252,4 +252,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   pantalla, y vuelve con la pantalla de bloqueo.
 - `0222`: `sweetfb_scale=1` experimental, iOS dibuja 960x1706 y el kernel
   escala x1.5 (menos píxeles para el renderizado por CPU).
+- **Más RAM (2026-10-23):** el segundo banco de DRAM (`0x880000000`,
+  2 GiB, sin `reserved-memory`) para XNU con `mkadt_herolte.py --bank2`.
+  Con 2 GiB el kernel ve la memoria pero entra en pánico en
+  `kmem_range_init` (no entran sus rangos virtuales). Con
+  `--bank2-mb 1024` arranca; los secundarios no llegaban (CPU_ON rc=0 con
+  entrada > 4 GiB) y `0223` entra por un trampolín en `0x8fffe000`:
+  **1 GiB y 8/8 núcleos**, pantalla de inicio "bastante más fluida, abre
+  todo mucho más rápido".
+- `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
+  superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
