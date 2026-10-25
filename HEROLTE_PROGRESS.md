@@ -377,7 +377,12 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
     combinación física **`Vol+` + `Home` → TWRP** en `a5xelte_keys.c`
     (confirmada en el teléfono sin palillos).
   - `xnu-boot.img` `6c10073a…c3f7`: kernel `0239` (`104d70f4…63f9`) con
-    resolución nativa `1440x2560` `@3x` (`sweetfb_native=1`).
+    resolución nativa `1440x2560` `@3x` (`sweetfb_native=1`). `en10` configurado
+    en `192.168.7.1/24` sin `sudo` mediante `networksetup -setmanual "Sweet iOS
+    (USB Ethernet)" 192.168.7.1 255.255.255.0`: `ping 192.168.7.2` responde con
+    0 % de pérdida (`1,53 ms` RTT) y el stream UDP en vivo (`192.168.7.1:5140`)
+    entrega en tiempo real los eventos `HEROLTE TOUCH:`, `A5XELTE FB:` y `exec`
+    mientras iOS 16 corre en el teléfono.
 - **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
   S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
   modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo
