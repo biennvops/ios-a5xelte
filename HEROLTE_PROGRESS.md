@@ -391,6 +391,16 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   sweetfb_gpu=1`) en **`avg_copy_us=3967` (~3,97 ms/cuadro)** con 3,7× menos
   píxeles para el rasterizador de `backboardd`. Reinicio remoto a TWRP por UDP
   (`"twrp"` → `192.168.7.2:5140`) verificado sin tocar el teléfono.
+- **Causa raíz del Dock/Widgets blancos y pérdida de blur al terminar la
+  animación (`artwork-display-gamut = "sRGB"` en `mkadt_herolte.py`,
+  `25027469…6458`):** `d22ap.adt` declaraba `artwork-display-gamut = "P3"`, lo
+  que hacía que `SpringBoard` y `backboardd` creasen las superficies en caché
+  del Dock (`1368x294`), fondo de pantalla y App Switcher (`1440x2560`,
+  `1007x1792`) en formatos P3 de 10 bits (`0x62336138` `'b3a8'` de 2 planos y
+  `0x77333072` `'w30r'`), que el rasterizador por software `CA::OGL::SW` no
+  soporta. Con `artwork-display-gamut = "sRGB"`, `SWEET SURF:` confirma que
+  todas esas superficies (`id 9..13, 16`) se crean como `0x42475241` (`'BGRA'`,
+  `planes 0`).
 - **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
   S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
   modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo

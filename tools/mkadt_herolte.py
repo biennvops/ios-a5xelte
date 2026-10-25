@@ -39,6 +39,10 @@ def child(node, name):
 
 def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, iphone8=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
+    product = child(root, 'product')
+    # CA::OGL::SW software renderer supports 8-bit sRGB ('BGRA' 0x42475241), not
+    # 10-bit Wide Color P3 ('b3a8' 2-plane 0x62336138 / 'w30r' 0x77333072).
+    set_prop(product, 'artwork-display-gamut', mkadt.cstr('sRGB'))
     if iphone8:
         # --iphone8: 16:9 iPhone 8 / SE screen, 375x667 points at @2x (750x1334),
         # matching the S7/S7 Edge 16:9 aspect ratio (zero stretch, zero bars)
