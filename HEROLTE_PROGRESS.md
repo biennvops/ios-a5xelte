@@ -381,5 +381,21 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   charging=1`; Mali-T880 presentando cuadros en `avg_copy_us=4462` (hasta
   9,2 fps).
 - **Prueba a resolución nativa `1440x2560` `@3x` (`f45b402a…31d5`,
-  `sweetfb_native=1`):** ADT sin `--scale2` (`canvas 1440x2560`) flasheado en
-  `BOOT` para eliminar las barras laterales de `0237`.
+  `sweetfb_native=1`):** pánico diagnóstico `0226` en pantalla (foto del
+  usuario, OCR): `HEROLTE: unaligned pmap_enter va=0xfffe37000
+  pte_p=0xfffffff824eb31b8 pte=0x4200088032acec3 kernel=0 bt
+  0xfffffff00740c68c ... 0xfffffff007414af8 0xfffffff007439be0
+  0xfffffff0073d5a7c 0xfffffff007aa8160 @pmap.c:5609`. Simbolizado contra
+  `kernel.development.herolte`: `_pmap_enter_pte` ←
+  `_pmap_enter_options_internal` ← **`_pmap_create_commpages + 0x1e8`** ←
+  `_commpage_populate` ← `_vm_commpage_init` ← `_zone_init`.
+- **Causa raíz de `unaligned pmap_enter` (el 75 % de los arranques):** en
+  `_pmap_create_commpages`, XNU elige la dirección aleatoria de
+  `commpage_text64` desplazando `random()` 12 bits (`4 KiB`, `0xfffe00000 |
+  (rand << 12)`), pero `commpage_pmap` usa páginas lógicas de `16 KiB`
+  (`write_pte_fast` exige `pte_p` alineado a 32 bytes, es decir `(rand & 3) ==
+  0`). En 3 de cada 4 arranques `(rand & 3) != 0` y entra en pánico en
+  `pmap_enter_pte`. Con `rand & 0xfc` en `_pmap_create_commpages` (`60978314…19c0`),
+  `commpage_text64` queda siempre alineado a 16 KiB y **arranca a la primera en
+  `1440x2560` `@3x` nativo (`sweetfb_native=1`)** a pantalla completa, con el
+  desenfoque del Centro de control funcionando.
