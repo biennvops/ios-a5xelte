@@ -37,9 +37,22 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, iphone8=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
-    if scale == 2:
+    if iphone8:
+        # --iphone8: 16:9 iPhone 8 / SE screen, 375x667 points at @2x (750x1334),
+        # matching the S7/S7 Edge 16:9 aspect ratio (zero stretch, zero bars)
+        # with 3.7x fewer pixels than 1440x2560 and physical Home button active.
+        set_prop(child(root, 'chosen'), 'display-scale', mkadt.u32(2))
+        product = child(root, 'product')
+        set_prop(product, 'artwork-device-subtype', mkadt.u32(1334))
+        set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
+        buttons = child(root, 'buttons')
+        set_prop(buttons, 'home-button-type', mkadt.u32(0))
+        set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
+                                                   ('volup', 'voldown', 'hold', 'home')))
+        canvas = (750, 1334)
+    elif scale == 2:
         # --scale2 (as syncmodz/ios-s9): a whole iPhone XR screen, 414x896
         # points at @2x (828x1792), 2.5x fewer pixels than the panel for
         # CoreAnimation's CPU renderer. UIKit picks the status bar layout by
@@ -158,9 +171,11 @@ if __name__ == '__main__':
                              'vm_compression_limit=98304), 2048 panics in write_pte_fast')
     parser.add_argument('--scale2', action='store_true',
                         help='iPhone XR screen, 828x1792 @2x (needs research/ipsw-x/d22ap.adt)')
+    parser.add_argument('--iphone8', action='store_true',
+                        help='16:9 iPhone 8 screen, 750x1334 @2x with Home button')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
     dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
-    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3))
+    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3, args.iphone8))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')

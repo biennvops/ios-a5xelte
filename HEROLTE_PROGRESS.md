@@ -383,6 +383,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
     0 % de pérdida (`1,53 ms` RTT) y el stream UDP en vivo (`192.168.7.1:5140`)
     entrega en tiempo real los eventos `HEROLTE TOUCH:`, `A5XELTE FB:` y `exec`
     mientras iOS 16 corre en el teléfono.
+- **Modo 16:9 `@2x` (`--iphone8` en `mkadt_herolte.py`, `23bdd15d…4c1f`):**
+  canvas `750x1334` (`375x667` puntos `@2x`, relación 16:9 exacta sin
+  estiramiento ni barras negras, `home-button-type = 0` con botón físico Home
+  activo y `artwork-device-subtype = 1334`), escalado a `1440x2560` por los 12
+  shader cores de la Mali-T880 (`sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334
+  sweetfb_gpu=1`) en **`avg_copy_us=3967` (~3,97 ms/cuadro)** con 3,7× menos
+  píxeles para el rasterizador de `backboardd`. Reinicio remoto a TWRP por UDP
+  (`"twrp"` → `192.168.7.2:5140`) verificado sin tocar el teléfono.
 - **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
   S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
   modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo
