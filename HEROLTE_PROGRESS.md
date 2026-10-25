@@ -360,9 +360,19 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   (`SRAM 35cac56b 60985ce0…` en vez de `00004000 0000009d…`). `xnu_boot.c`
   ahora recarga los 12.136 bytes del firmware Cortex-M3 en `0x11200000` si no
   está presente, y si `Vol+` (`GPA0-3`) está pulsado al arrancar pide TWRP.
-- `0239`: combinación `Vol+` + `Home` (`GPA0` pines 3 y 5) y hook de
-  pánico/halt para volcar `sec_log` (`0x91a00000`) y reiniciar a TWRP por PMU
-  `0x105c0000`.
+- **0239 compilado en Actions y probado en `hero2lte` (run `40194847651` en
+  `biennvops/ios-a5xelte`, kernel `104d70f4…63f9`, `xnu-boot.img`
+  `2eaa33fa…b4a7`):**
+  - `xnu_boot.c` conmuta el MUIC `MAX77854` (`0x25` en `HSI2C_1` `0x13650000`,
+    `CONTROL1 0x0c = 0x49`) a `USB_AP` tras S-Boot.
+  - `bsd/dev/sweet_usb.c` activado en `HEROLTE` (`DWC3 0x15400000`, `USBDRD PHY
+    0x15500000`, `PMU +0x704 = 1`): **macOS enumera en vivo `Sweet iOS (USB
+    Ethernet)` (`en10`, `idVendor=4617`, `idProduct=1`, `status: active`)**
+    mientras corre XNU/iOS 16, con streaming UDP del log a `192.168.7.1:5140`
+    y comando remoto UDP `"twrp"` en `:5140` para reiniciar a TWRP desde la Mac.
+  - `pmap_create_commpages` alineado a `PAGE_RATIO` (`16 KiB`), `sweetfb_stretch=1`
+    (estirado a pantalla completa `1440x2560` sin barras negras en `@2x`), y
+    combinación física `Vol+` + `Home` → TWRP en `a5xelte_keys.c`.
 - **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
   S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
   modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo
