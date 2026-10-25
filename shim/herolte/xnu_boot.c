@@ -146,6 +146,31 @@ uintptr_t hero_prepare_xnu(uintptr_t fdt, volatile uint64_t *log, uint64_t el, u
         hero_fb_text(1, "VOL UP HELD: TWRP");
         return 0;
     }
+    /* Switch MAX77854 MUIC (0x25 on HSI2C_1 0x13650000, GPD1-2/3) to USB_AP (reg 0x0c = 0x49). */
+    volatile uint32_t *gpd1 = (volatile uint32_t *)0x136d0040UL;
+    volatile uint32_t *i2c1 = (volatile uint32_t *)0x13650000UL;
+    gpd1[8 / 4] &= ~0xf0U;
+    gpd1[0 / 4] = (gpd1[0 / 4] & ~0xff00U) | 0x2200U;
+    i2c1[0x00 / 4] = 0x80000009U;
+    i2c1[0x00 / 4] = 0x00000009U;
+    i2c1[0x48 / 4] = 0;
+    i2c1[0x60 / 4] = 0x78787800U;
+    i2c1[0x64 / 4] = 0x3c007878U;
+    i2c1[0x68 / 4] = 0x000100f0U;
+    i2c1[0x6c / 4] = 0x3cU;
+    i2c1[0x08 / 4] = 0xfU;
+    i2c1[0x40 / 4] = 0x80000000U;
+    i2c1[0x20 / 4] = 0;
+    i2c1[0x24 / 4] = i2c1[0x24 / 4];
+    i2c1[0x04 / 4] = 3U | (1U << 16);
+    i2c1[0x70 / 4] = 0x25U << 10;
+    i2c1[0x00 / 4] = 0x89U;
+    i2c1[0x20 / 4] = 0xf81U;
+    i2c1[0x34 / 4] = 0x0cU;
+    i2c1[0x34 / 4] = 0x49U;
+    i2c1[0x44 / 4] = 2U | 0x20000U | 0x80000000U;
+    for (volatile unsigned i = 0; i < 200000 && (i2c1[0x50 / 4] & (1U << 17)); ++i)
+        ;
 #if defined(HAVE_APM_FW)
     volatile uint32_t *sram = (volatile uint32_t *)APM_SRAM_PA;
     if (sram[0] != 0x00004000U) {
@@ -249,6 +274,7 @@ uintptr_t hero_prepare_xnu(uintptr_t fdt, volatile uint64_t *log, uint64_t el, u
     log[10] = 5;
     hero_fb_hex(1, "ENTRY", entry_pa);
     hero_fb_hex(2, "BOOTARGS", ba_pa);
+    hero_fb_hex(4, "USBPMU", *(volatile uint32_t *)(APM_PMU_PA + 0x704UL));
     hero_fb_text(3, "JUMP TO XNU");
     clean_bytes(LOG_BASE, LOG_BASE + PAGE_SIZE);
     __asm__ volatile("ic iallu; dsb sy; isb" : : : "memory");
