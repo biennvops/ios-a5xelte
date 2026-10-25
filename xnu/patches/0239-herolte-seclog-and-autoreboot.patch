@@ -7,8 +7,8 @@ index 9576d7d..f0b1d79 100644
  			}
  			stable = sample;
 +#if defined(ARM64_BOARD_CONFIG_HEROLTE)
-+			/* Power + Home held together: sync sec_log and reboot to TWRP. */
-+			if (!(sample & (1u << a5_key_pins[0])) &&
++			/* Vol+ + Home held together: sync sec_log and reboot to TWRP. */
++			if (!(sample & (1u << a5_key_pins[1])) &&
 +			    !(sample & (1u << a5_key_pins[3]))) {
 +				extern void herolte_reboot_recovery(void);
 +				herolte_reboot_recovery();

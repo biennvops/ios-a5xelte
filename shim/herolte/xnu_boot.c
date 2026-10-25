@@ -23,7 +23,14 @@
 #define DRAM_LOW 0x80000000UL
 #define PAGE_SIZE 4096UL
 #define BOOT_LINE_LENGTH 608
-#define FAIL_DELAY_S 30U
+#define FAIL_DELAY_S 5U
+#define GPA0_DAT_PA 0x10580004UL
+#define APM_PMU_PA  0x105c0000UL
+#define APM_SRAM_PA 0x11200000UL
+#if __has_include("out/apm_fw.h")
+#include "out/apm_fw.h"
+#define HAVE_APM_FW 1
+#endif
 
 struct payload_seg {
     uint64_t vmaddr, vmsize, file_off, file_size;
@@ -69,13 +76,23 @@ static void copy_bytes(uintptr_t dst, uintptr_t src, uint64_t size)
         d[i] = s[i];
 }
 
+static void inval_bytes(uintptr_t start, uintptr_t end)
+{
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, CTR_EL0" : "=r" (ctr));
+    uintptr_t line = 4UL << ((ctr >> 16) & 0xf);
+    for (uintptr_t p = start & ~(line - 1); p < end; p += line)
+        __asm__ volatile("dc ivac, %0" : : "r" (p) : "memory");
+    __asm__ volatile("dsb sy" : : : "memory");
+}
+
 static void clean_bytes(uintptr_t start, uintptr_t end)
 {
     uint64_t ctr;
     __asm__ volatile("mrs %0, CTR_EL0" : "=r" (ctr));
     uintptr_t line = 4UL << ((ctr >> 16) & 0xf);
     for (uintptr_t p = start & ~(line - 1); p < end; p += line)
-        __asm__ volatile("dc cvac, %0" : : "r" (p) : "memory");
+        __asm__ volatile("dc civac, %0" : : "r" (p) : "memory");
     __asm__ volatile("dsb sy" : : : "memory");
 }
 
@@ -124,6 +141,25 @@ uintptr_t hero_prepare_xnu(uintptr_t fdt, volatile uint64_t *log, uint64_t el, u
     uint64_t rd_start, rd_end;
     log[77] = hero_fb_enable();
     hero_fb_text(0, "HEROLTE XNU LOADER");
+    /* Vol+ (GPA0 pin 3, active low) held at boot -> straight to TWRP. */
+    if ((*(volatile uint32_t *)GPA0_DAT_PA & (1U << 3)) == 0) {
+        hero_fb_text(1, "VOL UP HELD: TWRP");
+        return 0;
+    }
+#if defined(HAVE_APM_FW)
+    volatile uint32_t *sram = (volatile uint32_t *)APM_SRAM_PA;
+    if (sram[0] != 0x00004000U) {
+        volatile uint32_t *pmu = (volatile uint32_t *)APM_PMU_PA;
+        pmu[0x2500 / 4] |= 1U;
+        pmu[0x2508 / 4] &= ~(1U << 15);
+        __asm__ volatile("dsb sy" : : : "memory");
+        for (unsigned i = 0; i < sizeof(hero_apm_fw) / 4; ++i)
+            sram[i] = hero_apm_fw[i];
+        for (unsigned i = sizeof(hero_apm_fw) / 4; i < 4096; ++i)
+            sram[i] = 0;
+        __asm__ volatile("dsb sy" : : : "memory");
+    }
+#endif
     if (el != 4)
         return fail(log, -10, "NOT EL1");
     if (sctlr & 1)
@@ -169,6 +205,9 @@ uintptr_t hero_prepare_xnu(uintptr_t fdt, volatile uint64_t *log, uint64_t el, u
         return fail(log, -3, "KERNEL TOO LARGE");
 
     hero_fb_text(1, "COPYING KERNEL");
+    /* Discard stale cachelines from previous boots over SMP trampoline + XNU bootstrap RAM. */
+    inval_bytes(0x8fffe000UL, 0x8ffff000UL);
+    inval_bytes(p->phys_base, p->phys_base + (p->mem_size < 0x4000000UL ? p->mem_size : 0x4000000UL));
     for (uint32_t i = 0; i < p->nsegs; ++i) {
         const struct payload_seg *s = &p->segs[i];
         if (s->vmaddr < p->virt_base || s->file_size > s->vmsize ||

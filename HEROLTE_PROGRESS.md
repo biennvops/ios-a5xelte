@@ -326,3 +326,54 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
+
+## 2026-10-25 — hero2lte (Galaxy S7 Edge SM-G935K, Exynos 8890)
+
+- Dispositivo: SM-G935K (`G935KKKU3EVG2`, `hw_rev=8`), TWRP en `RECOVERY`.
+  Backups SHA-256 verificados de `BOOT` (`sda5`, 40 MiB), `EFS` (`sda3`,
+  20 MiB) y `RECOVERY` (`sda6`, 46 MiB) fuera de git (`backup/hero2lte/`).
+- Mapa de hardware verificado en vivo desde `/proc/device-tree`, `/proc/iomem`
+  y `dmesg`: idéntico a `herolte` en CPU (4× A53 `0x100..0x103` + 4× Mongoose
+  `0x0..0x3`), GIC-400 (`0x11001000`/`0x11002000`), RAM (`0x80000000+0x7e400000`
+  y Bank 2 `0x880000000+2G`), framebuffer `0xe2a00000` (`1440x2560`), DECON_F
+  `0x13960000`, UFS 2.0 `0x155a0000` (`KLUBG4G1CE-B0B1`, `USERDATA` `sda18` de
+  25.228 MiB), GPIO keys en ALIVE `0x10580000` (Power `GPA2-4`, Vol+/Vol−/Home
+  `GPA0-3/4/5`), `sec_ts` en `0x48` de `0x14e10000` (`LDO32=1,85V`,
+  `LDO33=3,3V` en `s2mps16@66` vía APM `0x11240000`), fuel gauge `max77854` en
+  `0x36` de `0x13650000` y Mali-T880 en `0x14ac0000`.
+- **Probe etapa 1 en `hero2lte`** (`probe-boot.img`, espejo en `sec_log`
+  `0x91a00000` leído desde `/proc/last_kmsg` tras el reinicio automático a
+  TWRP): `EL=1`, `SCTLR=0x30c5183e`, `FDT=0x8a000000`, `IMAGE=0x80104000`,
+  `MIDR=0x410fd034`, `MPIDR=0x80000100`, `MMFR0=0x1122` (`16K PAGES: NO`),
+  `PFR0=0x2222`, `ISAR0=0x11120`, `CNTFRQ=0`, `TRIG=0x12b0`, `INITRD`
+  `0x89000000..0x890dbf7f`.
+- **Primer arranque de XNU + UFS + PID 1 en `hero2lte`** (`herolog-1.txt`,
+  flush #4, 14.013 bytes): 1,5 GiB Bank 2 (`0x880000000`), `8/8 CPUs
+  initialized, SGI1 verified` (temporizadores ~21 ms en los 8 núcleos),
+  `SWEET BATTERY: 14% 3381mV -632mA rem=475mAh full=3436mAh`, GPIO keys
+  detectados (`key=0`, `key=2`), UFS LUN 0–3 listos + GPT de 18 particiones
+  (`p18 USERDATA 1348252+6458468 (25228 MiB)`), `hfs: mounted HEROTEST on
+  device b(1, 0)`, `*** SWEET userspace: init running as PID 1 ***`, y
+  Mali-T880 (`GPU_ID=0x8802000`, `shader=0xff0f`).
+- **Hallazgo APM SRAM tras reset duro de PMIC:** tras un reset de 7 s
+  (`MRSTB`), la SRAM del APM (`0x11200000`) pierde el firmware que carga Linux
+  (`SRAM 35cac56b 60985ce0…` en vez de `00004000 0000009d…`). `xnu_boot.c`
+  ahora recarga los 12.136 bytes del firmware Cortex-M3 en `0x11200000` si no
+  está presente, y si `Vol+` (`GPA0-3`) está pulsado al arrancar pide TWRP.
+- `0239`: combinación `Vol+` + `Home` (`GPA0` pines 3 y 5) y hook de
+  pánico/halt para volcar `sec_log` (`0x91a00000`) y reiniciar a TWRP por PMU
+  `0x105c0000`.
+- **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
+  S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
+  modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo
+  `dc cvac` sin invalidar antes dejaba líneas sucias/viejas en L2 (de TWRP o del
+  arranque previo) sobre `0x8fffe000` (trampolín SMP) y sobre las tablas de
+  páginas de bootstrap encima de `topOfKernelData`. `xnu_boot.c` ahora ejecuta
+  `dc ivac` sobre `0x8fffe000` y los primeros 64 MiB de la ventana de RAM antes
+  de copiar, y `dc civac` + `ic iallu` al terminar.
+- **🍎 iOS 16.7.16 arrancado en `hero2lte` (SM-G935K, `xnu-boot.img`
+  `b20ed162…145d`, root `72031acb…b86e7`):** 20 GiB HFSX en `USERDATA`
+  (320/320 bloques verificados), ADT `--bank2 --bank2-mb 1536 --scale2`
+  (canvas iPhone XR `828x1792` `@2x` escalado por la Mali-T880 con barras
+  negras, `sweetfb_scale=1 sweetfb_lw=828 sweetfb_lh=1792 sweetfb_gpu=1`,
+  8 núcleos con `0238`). Confirmado por el usuario en el teléfono.

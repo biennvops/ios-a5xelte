@@ -76,7 +76,10 @@ def main():
     if os.path.exists(a.state):
         done = {int(x) for x in open(a.state).read().split()}
     state = open(a.state, 'a')
-    stream = gzip.GzipFile(fileobj=Chain(a.parts))
+    with open(a.parts[0], 'rb') as first_f:
+        is_gz = first_f.read(2) == b'\x1f\x8b'
+    raw_chain = Chain(a.parts)
+    stream = gzip.GzipFile(fileobj=raw_chain) if is_gz else raw_chain
     zero = bytes(CHUNK)
     index = written = skipped = same = 0
     total = hashlib.sha256()
@@ -89,7 +92,7 @@ def main():
             return
         n = (end - first) * CHUNK // MIB
         adb(['shell', f'dd if=/dev/zero of={DEV} bs=1048576 seek={first * CHUNK // MIB} '
-             f'count={n} conv=fsync 2>/dev/null'], a.adb)
+             f'count={n} 2>/dev/null; sync'], a.adb)
         for i in range(first, end):
             state.write(f'{i}\n')
         state.flush()
@@ -128,7 +131,7 @@ def main():
                 adb(['push', local, '/tmp/chunk.gz'], a.adb)
                 seek, count = offset // MIB, (len(data) + MIB - 1) // MIB
                 out = adb(['shell', f'gzip -dc /tmp/chunk.gz | dd of={DEV} bs=1048576 '
-                           f'seek={seek} conv=fsync 2>&1; rm -f /tmp/chunk.gz'], a.adb)
+                           f'seek={seek} 2>&1; sync; rm -f /tmp/chunk.gz'], a.adb)
                 back = adb(['shell', f'dd if={DEV} bs=1048576 skip={seek} count={count} '
                             f'2>/dev/null | head -c {len(data)} | sha256sum'], a.adb).split()[0]
                 want = hashlib.sha256(data).hexdigest()
