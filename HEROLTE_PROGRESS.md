@@ -372,8 +372,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   `dc ivac` sobre `0x8fffe000` y los primeros 64 MiB de la ventana de RAM antes
   de copiar, y `dc civac` + `ic iallu` al terminar.
 - **🍎 iOS 16.7.16 arrancado en `hero2lte` (SM-G935K, `xnu-boot.img`
-  `b20ed162…145d`, root `72031acb…b86e7`):** 20 GiB HFSX en `USERDATA`
-  (320/320 bloques verificados), ADT `--bank2 --bank2-mb 1536 --scale2`
-  (canvas iPhone XR `828x1792` `@2x` escalado por la Mali-T880 con barras
-  negras, `sweetfb_scale=1 sweetfb_lw=828 sweetfb_lh=1792 sweetfb_gpu=1`,
-  8 núcleos con `0238`). Confirmado por el usuario en el teléfono.
+  `b20ed162…145d`, root `72031acb…b86e7`, `herolog-ios1.txt` flush #72,
+  112.713 bytes, `alive 720 s`):** 20 GiB HFSX en `USERDATA` (320/320 bloques
+  verificados); APM SRAM cargada por `xnu_boot.c` (`00004000 0000009d…`,
+  `S2MPS16 id=0x2 L32CTRL=0x2e->0xee L33CTRL=0x3c->0xfc`), `sec_ts`
+  (`id ac a5 52`, `tx=15 rx=27`, `moves=1539 i2c_retries=6 lost_reads=0`,
+  multitouch 0..2); batería `25% 3836mV +191mA rem=863mAh full=3484mAh
+  charging=1`; Mali-T880 presentando cuadros en `avg_copy_us=4462` (hasta
+  9,2 fps).
+- **Prueba a resolución nativa `1440x2560` `@3x` (`f45b402a…31d5`,
+  `sweetfb_native=1`):** ADT sin `--scale2` (`canvas 1440x2560`) flasheado en
+  `BOOT` para eliminar las barras laterales de `0237`.
