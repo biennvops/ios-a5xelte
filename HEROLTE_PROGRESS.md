@@ -370,9 +370,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
     Ethernet)` (`en10`, `idVendor=4617`, `idProduct=1`, `status: active`)**
     mientras corre XNU/iOS 16, con streaming UDP del log a `192.168.7.1:5140`
     y comando remoto UDP `"twrp"` en `:5140` para reiniciar a TWRP desde la Mac.
+    En `herolog-ios3.txt` (flush #31, 79.687 bytes): `SWEET USB: ue0 rx 116 tx
+    198 frames` intercambiados con macOS.
   - `pmap_create_commpages` alineado a `PAGE_RATIO` (`16 KiB`), `sweetfb_stretch=1`
     (estirado a pantalla completa `1440x2560` sin barras negras en `@2x`), y
-    combinación física `Vol+` + `Home` → TWRP en `a5xelte_keys.c`.
+    combinación física **`Vol+` + `Home` → TWRP** en `a5xelte_keys.c`
+    (confirmada en el teléfono sin palillos).
+  - `xnu-boot.img` `6c10073a…c3f7`: kernel `0239` (`104d70f4…63f9`) con
+    resolución nativa `1440x2560` `@3x` (`sweetfb_native=1`).
 - **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
   S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
   modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo
