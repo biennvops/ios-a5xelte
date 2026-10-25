@@ -343,7 +343,18 @@ diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.c
 index 61aaef9..2edc6a1 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -450,9 +450,11 @@ SweetHIDTouch::start(IOService *provider)
+@@ -400,7 +400,9 @@ SweetHIDButtons::start(IOService *provider)
+ void
+ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
+-	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
++	UInt32 page = (usage >> 16) ? (usage >> 16) : kHIDPage_Consumer;
++	usage &= 0xffffu;
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
+ 
+ 	if (event) {
+ 		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+@@ -450,9 +452,11 @@ SweetHIDTouch::start(IOService *provider)
  		 * 828x1792) is drawn full height and centered between black bars
  		 * (herolte_gpu.c): normalize over that strip. */
  		uint32_t lw = 0, lh = 0;
@@ -356,7 +367,7 @@ index 61aaef9..2edc6a1 100644
  			fLogicalW = (int)((uint64_t)lw * 2560 / lh);
  		}
  	}
-@@ -596,6 +598,19 @@ sweet_hid_key(int key, int down)
+@@ -596,6 +600,15 @@ sweet_hid_key(int key, int down)
  	}
  }
  
@@ -365,11 +376,7 @@ index 61aaef9..2edc6a1 100644
 +sweet_hid_kbd(uint32_t page, uint32_t usage, int down)
 +{
 +	if (gSweetButtons) {
-+		IOHIDEvent *ev = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down != 0);
-+		if (ev) {
-+			gSweetButtons->dispatchEvent(ev);
-+			ev->release();
-+		}
++		gSweetButtons->key((page << 16) | (usage & 0xffffu), down != 0);
 +	}
 +}
 +
