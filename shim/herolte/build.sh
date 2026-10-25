@@ -7,24 +7,41 @@ set -eu
 cd "$(dirname "$0")"
 : "${CROSS:=aarch64-linux-gnu-}"
 mkdir -p out
-CFLAGS="-c -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -nostdlib -fno-asynchronous-unwind-tables -fno-jump-tables -mgeneral-regs-only -mstrict-align -mcpu=cortex-a53 -Wall -Wextra -Werror"
+CFLAGS="-c -O2 -mcmodel=tiny -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -nostdlib -fno-asynchronous-unwind-tables -fno-jump-tables -mgeneral-regs-only -mstrict-align -mcpu=cortex-a53 -Wall -Wextra -Werror"
+if command -v "${CROSS}gcc" >/dev/null 2>&1; then
+    CC="${CROSS}gcc"
+    LD="${CROSS}ld"
+    LDFLAGS="-static -T image.ld --build-id=none --no-warn-rwx-segments"
+    READELF="${CROSS}readelf"
+    OBJCOPY="${CROSS}objcopy"
+    NM="${CROSS}nm"
+else
+    LLVM="${LLVM:-/opt/homebrew/opt/llvm/bin}"
+    LLD="${LLD:-/opt/homebrew/opt/lld@22/bin}"
+    CC="$LLVM/clang --target=aarch64-none-elf"
+    LD="$LLD/ld.lld"
+    LDFLAGS="-static -T image.ld --build-id=none"
+    READELF="$LLVM/llvm-readelf"
+    OBJCOPY="$LLVM/llvm-objcopy"
+    NM="$LLVM/llvm-nm"
+fi
 
 image() {
     name=$1; shift
     objs=""
     for src in "$@"; do
         obj="out/${name}_$(basename "$src" | tr . _).o"
-        "${CROSS}gcc" $CFLAGS "$src" -o "$obj"
+        $CC $CFLAGS "$src" -o "$obj"
         objs="$objs $obj"
     done
-    "${CROSS}ld" -static -T image.ld --build-id=none --no-warn-rwx-segments $objs -o "out/$name.elf"
+    $LD $LDFLAGS $objs -o "out/$name.elf"
     # A raw Image must be position independent: no absolute relocations.
-    if "${CROSS}readelf" -r $objs | grep -q 'ABS64'; then
+    if $READELF -r $objs | grep -q 'ABS64'; then
         echo "$name: absolute relocation found" >&2
         exit 1
     fi
-    "${CROSS}objcopy" -O binary "out/$name.elf" "out/$name.Image"
-    end=$("${CROSS}nm" "out/$name.elf" | awk '$3 == "_image_end" { print $1 }')
+    $OBJCOPY -O binary "out/$name.elf" "out/$name.Image"
+    end=$($NM "out/$name.elf" | awk '$3 == "_image_end" { print $1 }')
     python3 - "out/$name.Image" "$end" <<'PY'
 import sys
 from pathlib import Path

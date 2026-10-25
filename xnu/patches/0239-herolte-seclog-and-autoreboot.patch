@@ -1,0 +1,136 @@
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+index 9576d7d..f0b1d79 100644
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -109,6 +109,14 @@ a5_keys_thread(void *arg, wait_result_t result)
+ 				}
+ 			}
+ 			stable = sample;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++			/* Power + Home held together: sync sec_log and reboot to TWRP. */
++			if (!(sample & (1u << a5_key_pins[0])) &&
++			    !(sample & (1u << a5_key_pins[3]))) {
++				extern void herolte_reboot_recovery(void);
++				herolte_reboot_recovery();
++			}
++#endif
+ 		}
+ 		a5_keys_wait();
+ 	}
+diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
+index 9b46983..1d08139 100644
+--- a/bsd/dev/herolte_ufs.c
++++ b/bsd/dev/herolte_ufs.c
+@@ -634,6 +634,72 @@ struct herolte_log_header {
+ };
+ 
+ static int herolte_log_chan;
++static vm_offset_t herolte_seclog_va;
++static vm_offset_t herolte_pmu_va;
++
++void herolte_seclog_sync(void);
++void herolte_reboot_recovery(void);
++
++/*
++ * Exynos 8890 sec_debug log_kernel (phys 0x91a00000, 2 MiB): TWRP saves this
++ * region to /proc/last_kmsg on boot. Mirroring the XNU console ring here lets
++ * TWRP read the kernel log without touching UFS.
++ */
++void
++herolte_seclog_sync(void)
++{
++	const char *ring;
++	uint32_t rsize;
++	uint64_t total;
++
++	if (!herolte_seclog_va) {
++		herolte_seclog_va = ml_io_map(0x91a00000u, 0x200000u);
++		if (!herolte_seclog_va) {
++			return;
++		}
++	}
++	a5xelte_log_snapshot(&ring, &rsize, &total);
++	if (!ring || !rsize || !total) {
++		return;
++	}
++	volatile char *dst = (volatile char *)herolte_seclog_va;
++	static const char hdr[] = "\n=== HEROLOG SEC_LOG START ===\n";
++	static const char ftr[] = "\n=== HEROLOG SEC_LOG END ===\n";
++	uint32_t max_copy = 0x1e0000u;
++	uint64_t n = MIN(total, (uint64_t)max_copy);
++	uint64_t start = total - n;
++	uint32_t off = 0;
++	for (unsigned i = 0; i < sizeof(hdr) - 1; i++) {
++		dst[off++] = hdr[i];
++	}
++	for (uint64_t i = 0; i < n; i++) {
++		dst[off++] = ring[(start + i) % rsize];
++	}
++	for (unsigned i = 0; i < sizeof(ftr) - 1; i++) {
++		dst[off++] = ftr[i];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++void
++herolte_reboot_recovery(void)
++{
++	printf("HEROLTE: syncing sec_log and rebooting to TWRP recovery\n");
++	herolte_seclog_sync();
++	if (!herolte_pmu_va) {
++		herolte_pmu_va = ml_io_map(0x105c0000u, 0x1000u);
++	}
++	if (herolte_pmu_va) {
++		*(volatile uint32_t *)(herolte_pmu_va + 0x808u) = 0x12345678u;
++		*(volatile uint32_t *)(herolte_pmu_va + 0x80cu) = 0x12345674u;
++		__asm__ volatile("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(herolte_pmu_va + 0x400u) = 1u;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
+ 
+ static void
+ herolte_log_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -653,6 +719,15 @@ herolte_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (++ticks % 6 == 0) {
+ 			printf("HEROLTE LOG: alive %u s\n", ticks * 10);
+ 		}
++		herolte_seclog_sync();
++		uint32_t reboot_s = 0;
++		PE_parse_boot_argn("heroreboot", &reboot_s, sizeof(reboot_s));
++		if (reboot_s && ticks * 10 >= reboot_s) {
++			herolte_reboot_recovery();
++		}
++		if (!su.writable || su.nblocks < 2 * (1 + rsize / UFS_BLOCK)) {
++			continue;
++		}
+ 		a5xelte_log_snapshot(&ring, &rsize, &total);
+ 		if (total == flushed) {
+ 			continue;
+@@ -699,7 +774,7 @@ herolte_log_start(void)
+ 	uint32_t on = 1;
+ 	thread_t thread;
+ 	PE_parse_boot_argn("herolog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * (1 + (4u << 20) / UFS_BLOCK)) {
++	if (!on) {
+ 		return;
+ 	}
+ 	if (kernel_thread_start(herolte_log_thread, NULL, &thread) == KERN_SUCCESS) {
+@@ -875,6 +950,14 @@ herolte_ufs_probe(void)
+ 	}
+ 	lck_mtx_unlock(&herolte_ufs_lock);
+ 	printf("HEROLTE UFS: probe done (%d)\n", error);
++	herolte_seclog_sync();
++	uint32_t reboot_s = 0;
++	PE_parse_boot_argn("heroreboot", &reboot_s, sizeof(reboot_s));
++	if (reboot_s) {
++		printf("HEROLTE UFS: heroreboot=%u s; waiting before recovery reboot\n", reboot_s);
++		(void)tsleep(&herolte_log_chan, PZERO, "heroreboot", hz * (int)reboot_s);
++		herolte_reboot_recovery();
++	}
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */

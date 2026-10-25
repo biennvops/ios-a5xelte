@@ -6,7 +6,8 @@
 #include "../fdt.h"
 #include "fbtext.h"
 
-#define RECOVERY_DELAY_S 60U
+#define RECOVERY_DELAY_S 5U
+#define PROBE_LOG_BASE   0x8ffff000UL
 
 static uint64_t counter(void)
 {
@@ -49,6 +50,25 @@ void hero_probe_main(uintptr_t fdt, uint64_t el, uint64_t sctlr, uint64_t image)
     }
     /* MMFR0[23:20] TGran16: 0 means no 16 KiB pages (needs the 4 KiB XNU). */
     hero_fb_text(row++, ((mmfr0 >> 20) & 15U) ? "16K PAGES: YES" : "16K PAGES: NO");
+
+    volatile uint64_t *log = (volatile uint64_t *)PROBE_LOG_BASE;
+    log[0] = 0x31504f5245483248ULL; /* "H2HEROP1" */
+    log[1] = el >> 2;
+    log[2] = sctlr;
+    log[3] = fdt;
+    log[4] = image;
+    log[5] = midr;
+    log[6] = mpidr;
+    log[7] = mmfr0;
+    log[8] = pfr0;
+    log[9] = isar0;
+    log[10] = freq;
+    log[11] = trig_before;
+    log[12] = start;
+    log[13] = end;
+    for (uintptr_t p = PROBE_LOG_BASE; p < PROBE_LOG_BASE + 256; p += 64)
+        __asm__ volatile("dc cvac, %0" : : "r" (p) : "memory");
+    __asm__ volatile("dsb sy" : : : "memory");
 
     if (!freq)
         freq = 26000000U;   /* exynos8890.dtsi timer clock-frequency */

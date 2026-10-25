@@ -9,6 +9,8 @@
 #define DECON_F 0x13960000UL
 #define HW_SW_TRIG_CONTROL 0x70U
 #define HW_TRIG_EN ((1U << 12) | (1U << 4))
+/* Exynos8890 sec_debug log_kernel (phys 0x91a00000, 2 MiB), saved by TWRP to /proc/last_kmsg. */
+#define SEC_LOG_PA 0x91a00000UL
 #define SCALE 6U
 #define CELL_W (6U * SCALE)
 #define CELL_H (10U * SCALE)
@@ -70,6 +72,16 @@ static void fill_row(unsigned row, uint32_t pixel)
 
 void hero_fb_text(unsigned row, const char *s)
 {
+    if (row < 32) {
+        volatile char *dst = (volatile char *)(SEC_LOG_PA + (uintptr_t)row * 64U);
+        unsigned i = 0;
+        for (; i < 62U && s[i]; ++i)
+            dst[i] = s[i];
+        for (; i < 63U; ++i)
+            dst[i] = ' ';
+        dst[63] = '\n';
+        __asm__ volatile("dc cvac, %0; dsb sy" : : "r" (dst) : "memory");
+    }
     volatile uint32_t *fb = (volatile uint32_t *)HERO_FB_BASE;
     unsigned top = TOP + row * CELL_H + 2U * SCALE;
     if (top + 7U * SCALE >= HERO_FB_HEIGHT) return;
