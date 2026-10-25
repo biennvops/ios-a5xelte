@@ -401,6 +401,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   soporta. Con `artwork-display-gamut = "sRGB"`, `SWEET SURF:` confirma que
   todas esas superficies (`id 9..13, 16`) se crean como `0x42475241` (`'BGRA'`,
   `planes 0`).
+- **0239 actualizado (run `40201034349`, kernel `98962a00…d649`, `xnu-boot.img`
+  `dd40910c…0e6b`):** `SweetSurface.cpp` rechaza con `kIOReturnUnsupported` los
+  formatos hardware YUV/JPEG/10 bits (`0x34323066` `'420f'`, `0x4a504547`
+  `'JPEG'`, `0x62336138` `'b3a8'`, `0x77333072` `'w30r'`) para que `SpringBoard`
+  conserve las superficies `'BGRA'` (`0x42475241`) al finalizar las animaciones
+  del App Switcher en vez de sustituirlas por buffers `'420f'` vacíos (grises).
+  Además, `sweet_usb.c` y `SweetHID.cpp` aceptan `"type <texto>"` por UDP en
+  `192.168.7.2:5140` para inyectar pulsaciones de teclado USB HID desde la Mac.
 - **Causa de los pánicos intermitentes en reinicios en caliente (`xnu_boot.c`):**
   S-Boot entra a `xnu_boot` con MMU y D-cache apagadas (`SCTLR=0x30c5183e`), de
   modo que `copy_bytes`/`zero_bytes` escriben directo a DRAM; hacer solo
