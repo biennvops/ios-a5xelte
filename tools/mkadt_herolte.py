@@ -37,13 +37,25 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, iphone8=False):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, iphone8=False, plus=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     product = child(root, 'product')
     # CA::OGL::SW software renderer supports 8-bit sRGB ('BGRA' 0x42475241), not
     # 10-bit Wide Color P3 ('b3a8' 2-plane 0x62336138 / 'w30r' 0x77333072).
     set_prop(product, 'artwork-display-gamut', mkadt.cstr('sRGB'))
-    if iphone8:
+    if plus:
+        # --plus: 16:9 iPhone 8 Plus @3x Retina HD screen (414x736 pt = 1242x2208),
+        # exact 16:9 aspect ratio (zero stretch, zero bars), sharp @3x assets,
+        # official 414pt UIKeyboard layout (working '123' key), and Home button.
+        set_prop(child(root, 'chosen'), 'display-scale', mkadt.u32(3))
+        set_prop(product, 'artwork-device-subtype', mkadt.u32(2208))
+        set_prop(product, 'artwork-scale-factor', mkadt.u32(3))
+        buttons = child(root, 'buttons')
+        set_prop(buttons, 'home-button-type', mkadt.u32(0))
+        set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
+                                                   ('volup', 'voldown', 'hold', 'home')))
+        canvas = (1242, 2208)
+    elif iphone8:
         # --iphone8: 16:9 iPhone 8 / SE screen, 375x667 points at @2x (750x1334),
         # matching the S7/S7 Edge 16:9 aspect ratio (zero stretch, zero bars)
         # with 3.7x fewer pixels than 1440x2560 and physical Home button active.
@@ -177,9 +189,11 @@ if __name__ == '__main__':
                         help='iPhone XR screen, 828x1792 @2x (needs research/ipsw-x/d22ap.adt)')
     parser.add_argument('--iphone8', action='store_true',
                         help='16:9 iPhone 8 screen, 750x1334 @2x with Home button')
+    parser.add_argument('--plus', action='store_true',
+                        help='16:9 iPhone 8 Plus screen, 1242x2208 @3x with Home button')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
     dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
-    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3, args.iphone8))
+    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3, args.iphone8, args.plus))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')
