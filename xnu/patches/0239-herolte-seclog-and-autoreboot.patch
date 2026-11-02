@@ -383,16 +383,3 @@ index 61aaef9..2edc6a1 100644
  extern "C" void
  sweet_hid_touch(int finger, int down, int x, int y)
  {
-diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index d2462d8..31d4db9 100644
---- a/osfmk/arm/pmap/pmap.c
-+++ b/osfmk/arm/pmap/pmap.c
-@@ -10903,7 +10903,7 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
- 	vm_map_address_t commpage_text_va = 0;
- 
- 	do {
--		int text_leaf_index = random() % num_ptes;
-+		int text_leaf_index = (random() % num_ptes) & ~(PAGE_RATIO - 1);
- 
- 		// Generate a VA for the commpage text with the same root and twig index as data
- 		// comm page, but with new leaf index we've just generated.
