@@ -321,8 +321,36 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   franja. Pendiente de probar.
 - **0238 (de ios-s9):** los hilos de UI y render van a los Mongoose
   (cpus 4-7) en vez de los A53, y AppleKeyStore responde wrap/unwrap
-  (securityd reintentaba sin fin y cada llamada iba al log). Pendiente de
-  probar.
+  (securityd reintentaba sin fin y cada llamada iba al log). Probado:
+  más fluido, log de AKS de 1600 a 19 líneas. El XR deja barras negras y
+  el Centro de Control sin blur (fondo negro: el blur es de Metal).
+- **0239: HeroGPU, etapa 1 de la aceleración completa.** Servicio IOKit
+  para que procesos de iOS usen la Mali (GetParam con los números de
+  Panfrost, CreateBO/FreeBO/MapBO, Submit). Selftest en el teléfono:
+  `GPU_ID 0x880 rev 0x2000 shaders 0xff0f`, un WRITE_VALUE desde un buffer
+  de usuario en VA 0x40000000 → **OK en 115 µs**. Siguiente: Mesa Panfrost
+  compilado para iOS con un libdrm sobre HeroGPU (como Bergamota con
+  freedreno), luego la capa Metal de Chlorophyll.
+- **0240-0242: programas de iOS en la GPU.** Zona de "drop" en USERDATA
+  (`tools/herolte-drop.py` desde TWRP, el kernel la instala en
+  `/private/var/herolte/` cuando la raíz pasa a lectura-escritura; launchd
+  corre `autorun`). 0242 corrige `pmap_sync_page_attributes_phys`, que
+  truncaba direcciones físicas sobre 4 GiB (panic en MapBO). Probado con
+  `herogpu-test` desde iOS: los parámetros de Panfrost, WRITE_VALUE → OK en
+  358 µs y un FRAGMENT clear de 64x64 → **4096/4096 píxeles OK en 197 µs**.
+- **Etapa 2 (`gpu/mesa`, workflow `mesa-ios`):** Mesa 25.0.7 Panfrost
+  (Gallium + compilador Midgard) dentro de OSMesa, compilado para iOS, con
+  un libdrm que traduce los ioctl de Panfrost a HeroGPU. `osmesa-test`
+  dibuja un triángulo con OpenGL y mide fps; resultado en el log del kernel.
+- **Primer OpenGL en la Mali desde iOS.** `GL_RENDERER = Mali-T880
+  (Panfrost)`, GL 2.1. Hicieron falta dos arreglos: 0243 configura la GPU
+  como Linux para un T880 r2p0 (`SHADER_CONFIG.LS_ALLOW_ATTR_TYPES`,
+  clock gate del tiler, throttle del JM), y el libdrm devuelve a Mesa el
+  tamaño real del heap del tiler (32 MiB, no los 128 pedidos: el tiler
+  escribía sobre otros buffers → DATA_INVALID_FAULT 0x58). Resultado: sin
+  fallos, centro rojo `0xff0000ff`, fondo azul, 8192 píxeles del triángulo
+  exactos; **256x256 a 159 fps** con `glFinish` en cada frame. Siguiente:
+  la capa Metal de Chlorophyll sobre este Panfrost, para CoreAnimation.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
@@ -445,3 +473,23 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   `commpage_text64` queda siempre alineado a 16 KiB y **arranca a la primera en
   `1440x2560` `@3x` nativo (`sweetfb_native=1`)** a pantalla completa, con el
   desenfoque del Centro de control funcionando.
+## 2026-10-31: aceleración por GPU usable
+
+- Resolución interna de iPhone 8 (750x1334 @2x, `mkadt_herolte.py --iphone8`), escalada por la GPU al panel. La fluidez mejora mucho.
+- Boot args: `sweetfb_native=1 sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334 sweetfb_gpu=1 herogpu_mhz=650 herocpu_mhz=2600 herosb=1`.
+- Medido: Mongoose 2598 MHz a 1075 mV, GPU 650 MHz. En reposo 7-22 % de 800 % de CPU.
+- `hero-run` mueve `BTAudioHALPlugin` fuera de `HAL/`: `launchd` y `mediaserverd` dejan de gastar CPU. La pista es de ios-s9.
+- Fondo: imagen fija desde SpringBoard (`herosb.c`, `herosb=1`). No hay proveedores de PosterBoard, la galería sigue vacía.
+- Lista de servicios desactivados: `tools/herolte-disabled.list`, copiada como `disabled.list` a la zona de drop. Con 41 servicios SpringBoard no dibujaba: algún servicio de los otros 13 es necesario, sin identificar.
+- Gestos: con `home-button-type` 2 aparece la barra roja. Con 1 no hay barra, pero tampoco gestos. Forzar `_UIStatusBarVisualProvider_Phone` en SpringBoard lo hace cerrarse; `gestures.off` en la zona de drop deja esos ganchos apagados.
+- `JOB_READ_FAULT` (0x42): tras él ni un trabajo en memoria del kernel corre; no lo curan hard reset ni apagar el dominio G3D. No se vio desde el cambio de resolución, en pocas pruebas. Causa desconocida.
+- Falta: límite térmico, audio, Wi-Fi.
+## Pantalla a 60 Hz reales (0296-0297)
+
+El bootloader deja el vclk de DECON_F en el oscilador de 26 MHz (`MUX_DISP_PLL`, CMU_DISP0 +0x200, bit 12 en 0): 363 ciclos por línea, 35,8 ms por cuadro, un TE de cada tres, 20 Hz, aunque iOS dibujara 40-50 fps. Con el vclk en DISP_PLL (62,5 MHz): 14,88 ms por cuadro, período 16,74 ms (59,7 Hz), medido con el contador de líneas (DECON +0x8c). Sin relación: eclk, relojes de bus, MULTI_PKT_CNT. Los cortes horizontales siguen: un solo cuadro en memoria, reescrito mientras DECON lo lee.
+
+## Sonido en iOS (0300-0303)
+
+El I2S está en reset hasta `CON_RSTCLR` (+0x00 bit 31); sin eso una escritura traba un núcleo. MOD: OPCLK de PCLK, CDCLK de entrada, esclavo. `heroaudio=3`: `/dev/hakios-audio` antes de que arranque mediaserverd y el plug-in AudioServerPlugIn de HakiOS (`gpu/hakios-audio`, MIT) en `/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver`. El kernel alimenta el FIFO a mano, por tiempo. Probado: tono de llamada y teclado por el parlante, barra de volumen.
+
+- **Extensiones, GPU y Wi-Fi (2026-11-01):** el kernel ahora responde la consulta `0x60` de AMFI (idea del kernel del JM21): iOS pasa de 1 a 516 plug-ins y aparecen widgets y fondos. El cuelgue que siguió era un bug propio: la tabla L3 número 176 del pool de usuario caía sobre el nivel 0 de la GPU (`0x8ffc0000`), a unos 350 MB de buffers, y ningún reset lo arreglaba; `0307` le da al pool su bloque en `0x8fc00000`. Wi-Fi: con el orden y los tiempos de Samsung el enlace PCIe sube al primer intento, `14e4:4415`, ChipCommon `0x17094359`. Falta firmware y driver. Pendiente: `CalendarWidgetExtension` usa 2 núcleos unos 7 minutos tras cada arranque y launchd reintenta `AegirPoster`.

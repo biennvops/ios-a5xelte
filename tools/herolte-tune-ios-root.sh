@@ -6,6 +6,8 @@
 #     holds SpringBoard's system-shell check-in until DataMigration finishes,
 #     and the migration plugin wrapper aborts on every boot.
 #   - CommCenter jobs removed from launchd.plist (no modem: crash loop).
+#   - com.herolte.autorun added: runs /private/var/herolte/autorun at boot
+#     (test programs from the kernel's USERDATA drop zone).
 #   - SpringBoard watchdogs off; Setup (purplebuddy) exempt from the scene
 #     watchdog (it blocks in CoreTelephony without CommCenter).
 #   - Setup marked complete (donor image v14), no cloud configuration UI.
@@ -34,6 +36,13 @@ plist() {  # plist FILE KEY TYPE VALUE ...  (creates or updates entries)
     chown 501:501 "$file"
     chmod 0600 "$file"
 }
+
+# WallpaperKit offers only the wallpapers that name this screen's class
+# (1440x2560 at @3x); the IPSW has none. The 375w-812h ones are given it.
+find "$root/Library/Wallpaper/Collections" -path '*375w-812h*' -name Wallpaper.plist -print0 |
+while IFS= read -r -d '' wallpaper; do
+    /usr/bin/plutil -replace logicalScreenClass -string '480w-853h@3x~iphone' "$wallpaper"
+done
 
 plist "$prefs/com.apple.migration.plist" LastSystemVersion string "$build"
 plist "$prefs/com.apple.springboard.plist" \
@@ -69,9 +78,21 @@ for section in ('LaunchDaemons', 'Agents', 'LaunchAgents'):
             del jobs[key]
 if not removed:
     sys.exit('no CommCenter job found in launchd.plist')
+# Developer hook: /private/var/herolte/autorun once per boot, as root, if the
+# kernel's USERDATA drop zone put it there (bsd/dev/herolte_drop.c,
+# tools/herolte-drop.py). Without the file launchd just logs an error.
+data['LaunchDaemons']['/System/Library/LaunchDaemons/com.herolte.autorun.plist'] = {
+    'Label': 'com.herolte.autorun',
+    'ProgramArguments': ['/private/var/herolte/autorun'],
+    'RunAtLoad': True,
+    'UserName': 'root',
+    'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/private/var/herolte/autorun.out',
+    'StandardErrorPath': '/private/var/herolte/autorun.out',
+}
 with open(path, 'wb') as f:
     plistlib.dump(data, f, fmt=fmt)
-print('launchd.plist: removed', ', '.join(removed))
+print('launchd.plist: removed', ', '.join(removed), '; added com.herolte.autorun')
 EOF
 
 containers="$root/private/var/containers"
