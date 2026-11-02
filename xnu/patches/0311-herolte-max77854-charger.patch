@@ -1,5 +1,4 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index a0c613a..44bc4d8 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,12 +18,17 @@
@@ -20,7 +19,7 @@ index a0c613a..44bc4d8 100644
  #define FG_REPCAP       0x05
  #define FG_REPSOC       0x06
  #define FG_VCELL        0x09
-@@ -32,6 +37,17 @@ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah,
+@@ -32,6 +37,17 @@
  /* DTB fuelgauge,capacity_max: Samsung shows 99.0 % of REPSOC as 100 %. */
  #define FG_CAPACITY_MAX 990u
  
@@ -38,7 +37,7 @@ index a0c613a..44bc4d8 100644
  #define HSI2C_CTL       0x00
  #define HSI2C_FIFO_CTL  0x04
  #define HSI2C_TRAILING  0x08
-@@ -89,7 +105,7 @@ fg_bus_init(void)
+@@ -89,7 +105,7 @@
   * Linux i2c-exynos5.c does for every message but the last.
   */
  static bool
@@ -47,7 +46,7 @@ index a0c613a..44bc4d8 100644
  {
  	uint32_t last = 0;
  	bool xfer_done = false;
-@@ -97,7 +113,7 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+@@ -97,7 +113,7 @@
  
  	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
  	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
@@ -56,7 +55,7 @@ index a0c613a..44bc4d8 100644
  	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
  	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
  	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
-@@ -155,7 +171,7 @@ fg_word(uint8_t reg, uint16_t *value)
+@@ -155,7 +171,7 @@
  {
  	uint8_t b[2];
  	for (unsigned attempt = 0; attempt < 3; attempt++) {
@@ -65,7 +64,7 @@ index a0c613a..44bc4d8 100644
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +208,132 @@ herolte_fg_init(void)
+@@ -192,10 +208,141 @@
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
@@ -132,7 +131,7 @@ index a0c613a..44bc4d8 100644
 + * CURRENT then reads positive, which SweetBattery already reports as
 + * "charging". Boot-arg herochg=0 leaves the PMIC as the bootloader had it.
 + */
-+int
+ int
 +herolte_chg_init(void)
 +{
 +	int enabled = 1;
@@ -183,10 +182,18 @@ index a0c613a..44bc4d8 100644
 +	return 0;
 +}
 +
-+/* CHG_DTLS (DETAILS_01 bits 4-7): 1 pre-charge, 2 fast, 3 top-off, 4 done. */
++/*
++ * CHG_DTLS (DETAILS_01 bits 4-7): 1 pre-charge, 2 fast, 3 top-off, 4 done.
++ * Called from SweetBattery's poll: the charger's watchdog (WDTEN, left on by
++ * the bootloader - CNFG_00 reads are not stable, so clearing it is not
++ * trustworthy) is kicked here instead, with CNFG_06's WDT-clear bit, as
++ * Linux's health read does. Without the kick, charging dies about 128 s in
++ * (observed: positive current at init, negative at the first poll).
++ */
 +bool
 +herolte_chg_active(void)
 +{
++	(void)fg_write_reg(CHG_ADDR, CHG_CNFG_06, 0x01);
 +	uint8_t dtls;
 +	if (!chg_byte(CHG_DETAILS_01, &dtls)) {
 +		return false;
@@ -195,9 +202,10 @@ index a0c613a..44bc4d8 100644
 +	return chg >= 1 && chg <= 4;
 +}
 +
- int
++int
  herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
  {
+ 	uint16_t soc, vcell, current, rem, full;
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 6d8a0fd..194b611 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
