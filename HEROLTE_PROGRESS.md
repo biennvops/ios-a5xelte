@@ -493,3 +493,26 @@ El bootloader deja el vclk de DECON_F en el oscilador de 26 MHz (`MUX_DISP_PLL`,
 El I2S está en reset hasta `CON_RSTCLR` (+0x00 bit 31); sin eso una escritura traba un núcleo. MOD: OPCLK de PCLK, CDCLK de entrada, esclavo. `heroaudio=3`: `/dev/hakios-audio` antes de que arranque mediaserverd y el plug-in AudioServerPlugIn de HakiOS (`gpu/hakios-audio`, MIT) en `/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver`. El kernel alimenta el FIFO a mano, por tiempo. Probado: tono de llamada y teclado por el parlante, barra de volumen.
 
 - **Extensiones, GPU y Wi-Fi (2026-11-01):** el kernel ahora responde la consulta `0x60` de AMFI (idea del kernel del JM21): iOS pasa de 1 a 516 plug-ins y aparecen widgets y fondos. El cuelgue que siguió era un bug propio: la tabla L3 número 176 del pool de usuario caía sobre el nivel 0 de la GPU (`0x8ffc0000`), a unos 350 MB de buffers, y ningún reset lo arreglaba; `0307` le da al pool su bloque en `0x8fc00000`. Wi-Fi: con el orden y los tiempos de Samsung el enlace PCIe sube al primer intento, `14e4:4415`, ChipCommon `0x17094359`. Falta firmware y driver. Pendiente: `CalendarWidgetExtension` usa 2 núcleos unos 7 minutos tras cada arranque y launchd reintenta `AegirPoster`.
+
+## Cargador MAX77854 (0311, en curso)
+
+- iOS nunca cargó: sin driver, la ruta CHG del PMIC queda apagada y el teléfono
+  descarga aunque esté el cable (−300 mA medidos con USB conectado). TWRP sí carga
+  (el bootloader deja la ruta andando); la celda está bien.
+- El cargador es el dispositivo i2c 0x69 en el mismo HSI2C_1 que el medidor (0x36);
+  registros 0xB0..0xC3 (CNFG_00..12, DETAILS_00/01).
+- **Bug 1:** escribir un registro con dos `fg_message()` (reg y valor separados)
+  NUNCA llega: cada mitad es su propia transacción y el cargador toma la primera
+  como comando nulo. La escritura correcta es un `fg_message()` de 2 bytes con
+  stop (`reg, value` en la misma transacción AUTO_CONF).
+- **Bug 2:** bits de CNFG_00 según el layout max77823: bit0 CHG_EN (0x01), bit1
+  BOOST, bit2 BUCK (0x04), bit3 WDTEN (0x08). Los bits 4-5 que usé primero son
+  reservados y la escritura quedaba en 0.
+- Con ambas correcciones: `CNFG 0xb1 0x1a -> 0x38` y `0xb9 0x6a -> 0x5` verifican,
+  y la lectura de CURRENT del medidor es positiva justo tras el init
+  (`charging=1` en el arranque, 4307 mV), pero a los 2 minutos vuelve a negativa:
+  el cargador arranca y luego se apaga solo. Sospechas: el watchdog (sin kicker),
+  la lectura inestable de CNFG_00 (0x2, 0xe1, 0x0 en un mismo arranque) o la
+  protección de escritura de CNFG_00 ligada a CNFG_06 (que también lee 0xff).
+- Siguiente build: volcado de los 20 registros dos veces para distinguir lecturas
+  NAK (todo unos) de valores reales.
