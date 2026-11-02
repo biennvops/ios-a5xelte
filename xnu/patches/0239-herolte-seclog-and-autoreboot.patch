@@ -36,7 +36,7 @@ diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
 index 9b46983..439d4ff 100644
 --- a/bsd/dev/herolte_ufs.c
 +++ b/bsd/dev/herolte_ufs.c
-@@ -634,6 +634,101 @@ struct herolte_log_header {
+@@ -634,6 +634,158 @@ struct herolte_log_header {
  };
  
  static int herolte_log_chan;
@@ -135,13 +135,71 @@ index 9b46983..439d4ff 100644
 +		__asm__ volatile("wfe");
 +	}
 +}
++
++/*
++ * Panic hook (installed over PE_arm_debug_panic_hook, a mutable pointer on
++ * DEVELOPMENT builds): everything it touches is pre-mapped at boot, so it
++ * needs no locks, no allocator and no ml_io_map (the first attempt panicked
++ * inside the panic doing exactly that). It runs with interrupts disabled on
++ * the panicking CPU, so the wait is a cntpct busy loop: Vol+ + Home during
++ * it restarts into TWRP at once, and so does the 10 s timeout alone, for a
++ * phone with nobody at the buttons. The log is already in sec_log.
++ */
++static vm_offset_t herolte_alive_va;
++void herolte_panic_hook(const char *str);
++void herolte_panic_init(void);
++extern void (*PE_arm_debug_panic_hook)(const char *str);
++
++void
++herolte_panic_hook(const char *str)
++{
++	if (!herolte_seclog_va || !herolte_pmu_va) {
++		return;
++	}
++	herolte_seclog_sync();
++	uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	if (freq == 0) {
++		freq = 24000000u;
++	}
++	uint64_t deadline = __builtin_arm_rsr64("CNTPCT_EL0") + freq * 10;
++	while (__builtin_arm_rsr64("CNTPCT_EL0") < deadline) {
++		if (herolte_alive_va) {
++			uint32_t gpa0 = *(volatile uint32_t *)(herolte_alive_va + 0x04u);
++			/* Volume Up GPA0-3 and Home GPA0-5, active low. */
++			if (!(gpa0 & ((1u << 3) | (1u << 5)))) {
++				break;
++			}
++		}
++	}
++	*(volatile uint32_t *)(herolte_pmu_va + 0x808u) = 0x12345678u;
++	*(volatile uint32_t *)(herolte_pmu_va + 0x80cu) = 0x12345674u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(herolte_pmu_va + 0x400u) = 1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
++void
++herolte_panic_init(void)
++{
++	herolte_seclog_va = ml_io_map(0x91a00000u, 0x200000u);
++	herolte_pmu_va = ml_io_map(0x105c0000u, 0x1000u);
++	herolte_alive_va = ml_io_map(0x10580000u, 0x1000u);
++	if (herolte_seclog_va && herolte_pmu_va && herolte_alive_va) {
++		PE_arm_debug_panic_hook = herolte_panic_hook;
++		printf("HEROLTE: panic hook installed (Vol+Home or 10 s to TWRP)\n");
++	}
++}
  
  static void
  herolte_log_thread(__unused void *arg, __unused wait_result_t wr)
-@@ -784,6 +879,7 @@ herolte_ufs_init(void)
+@@ -784,6 +936,8 @@ herolte_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	herolte_log_start();
++	herolte_panic_init();
 +	sweet_usb_probe();
  	return 0;
  }
