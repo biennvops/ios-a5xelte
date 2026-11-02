@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index a0c613a..e9acff5 100644
+index a0c613a..d1a09d7 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,12 +18,17 @@
@@ -64,16 +64,16 @@ index a0c613a..e9acff5 100644
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +207,138 @@ herolte_fg_init(void)
+@@ -192,9 +207,111 @@ herolte_fg_init(void)
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
 +	if (herolte_chg_init() != 0) {
 +		printf("HEROLTE FG: charger half missing; iOS will not charge\n");
 +	}
-+	return 0;
-+}
-+
+ 	return 0;
+ }
+ 
 +/* One charger register byte, and a verify-after-write update. */
 +static bool
 +chg_byte(uint8_t reg, uint8_t *value)
@@ -90,43 +90,16 @@ index a0c613a..e9acff5 100644
 +	return false;
 +}
 +
-+/*
-+ * One i2c transaction: START, addr+W, reg, value, STOP. Two separate fg_message()
-+ * halves would leave the register pointer alone between them (the charger takes
-+ * a value-less write as a null command), so a real write needs this. One short
-+ * attempt: the transfer bit never clears on a NAK, and waiting a long time here
-+ * stalls boot (the bus resets below).
-+ */
++/* A register write is one fg_message() with both bytes: reg and value in the
++ * same transaction (AUTO_CONF carries the 2-byte count). */
 +static bool
 +fg_write_reg(uint8_t addr, uint8_t reg, uint8_t value)
 +{
 +	uint8_t msg[2] = { reg, value };
-+	fg_wr(fg_i2c, HSI2C_ADDR, (uint32_t)addr << 10);
-+	fg_wr(fg_i2c, HSI2C_INT_STAT, 0xffffffff);
-+	fg_wr(fg_i2c, HSI2C_INT_EN, 0x10);
-+	unsigned done = 0;
-+	bool sent = false;
-+	for (unsigned t = 0; t < 500; t++) {
-+		if (done < sizeof(msg) && !(fg_rd(fg_i2c, HSI2C_FIFO_STAT) & (1u << 7))) {
-+			fg_wr(fg_i2c, HSI2C_TX_DATA, msg[done++]);
-+			continue;
-+		}
-+		uint32_t last = fg_rd(fg_i2c, HSI2C_INT_STAT);
-+		if (last & 0x10) {
-+			fg_wr(fg_i2c, HSI2C_INT_STAT, 0x10);
-+			sent = true;
-+		}
-+		if (sent && !(fg_rd(fg_i2c, HSI2C_TRANS) & (1u << 17))) {
-+			break;
-+		}
-+		delay(1);
-+	}
-+	fg_wr(fg_i2c, HSI2C_INT_EN, 0);
-+	fg_bus_init();
-+	return sent;
++	return fg_message(addr, false, msg, 2, true);
 +}
 +
-+/* Read-modify-write with the state logged, one try, no verify loop. */
++/* Read-modify-write with the state logged. */
 +static bool
 +chg_update(uint8_t reg, uint8_t value, uint8_t mask)
 +{
@@ -185,9 +158,9 @@ index a0c613a..e9acff5 100644
 +	}
 +	(void)chg_byte(CHG_CNFG_00, &id);
 +	printf("HEROLTE CHG: charging enabled, CNFG_00=%#x\n", id);
- 	return 0;
- }
- 
++	return 0;
++}
++
 +/* CHG_DTLS (DETAILS_01 bits 4-7): 1 pre-charge, 2 fast, 3 top-off, 4 done. */
 +bool
 +herolte_chg_active(void)
