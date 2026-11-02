@@ -1,3 +1,187 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index a0c613a..619a0b1 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -18,12 +18,17 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int herolte_fg_init(void);
+ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
++int herolte_chg_init(void);
++bool herolte_chg_active(void);
+ 
+ #define FG_HSI2C_PA     0x13650000u
+ #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
+ /* GPD1 pins 0/1 (HSI2C_0, speaker amp) are left as found. */
+ #define FG_GPD1         0x40
+ #define FG_ADDR         0x36u
++/* The MAX77854's charger half is a second i2c device on this bus (Linux
++ * max77854_charger.c; TWRP: "chg i2c client dummy at 0x69"). Registers 0xB0..0xC3. */
++#define CHG_ADDR        0x69u
+ #define FG_REPCAP       0x05
+ #define FG_REPSOC       0x06
+ #define FG_VCELL        0x09
+@@ -32,6 +37,17 @@ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah,
+ /* DTB fuelgauge,capacity_max: Samsung shows 99.0 % of REPSOC as 100 %. */
+ #define FG_CAPACITY_MAX 990u
+ 
++/* Charger registers (Linux max77854-private.h; 0xB0..0xC3 on the 0x69 device). */
++#define CHG_CNFG_00     0xB0u   /* bit 0 CHG_EN, bit 1 BOOST, bit 2 BUCK, bit 3 WDTEN
++                                 * (Linux max77823_charger.c; the same layout on 77854) */
++#define CHG_CNFG_01     0xB1u
++#define CHG_CNFG_02     0xB2u
++#define CHG_CNFG_03     0xB3u
++#define CHG_CNFG_05     0xB5u
++#define CHG_CNFG_06     0xB6u
++#define CHG_CNFG_09     0xB9u   /* AICR: input current limit, 100 mA units */
++#define CHG_DETAILS_01  0xBAu   /* bits 4-7: CHG_DTLS */
++
+ #define HSI2C_CTL       0x00
+ #define HSI2C_FIFO_CTL  0x04
+ #define HSI2C_TRAILING  0x08
+@@ -89,7 +105,7 @@ fg_bus_init(void)
+  * Linux i2c-exynos5.c does for every message but the last.
+  */
+ static bool
+-fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
++fg_message(uint8_t addr, bool receive, uint8_t *bytes, unsigned count, bool stop)
+ {
+ 	uint32_t last = 0;
+ 	bool xfer_done = false;
+@@ -97,7 +113,7 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 
+ 	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
+ 	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
+-	fg_wr(fg_i2c, HSI2C_ADDR, FG_ADDR << 10);
++	fg_wr(fg_i2c, HSI2C_ADDR, (uint32_t)addr << 10);
+ 	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
+ 	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
+ 	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
+@@ -155,7 +171,7 @@ fg_word(uint8_t reg, uint16_t *value)
+ {
+ 	uint8_t b[2];
+ 	for (unsigned attempt = 0; attempt < 3; attempt++) {
+-		if (fg_message(false, &reg, 1, false) && fg_message(true, b, 2, true)) {
++		if (fg_message(FG_ADDR, false, &reg, 1, false) && fg_message(FG_ADDR, true, b, 2, true)) {
+ 			*value = (uint16_t)(b[0] | (b[1] << 8));
+ 			return true;
+ 		}
+@@ -192,9 +208,116 @@ herolte_fg_init(void)
+ 		return -1;
+ 	}
+ 	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
++	if (herolte_chg_init() != 0) {
++		printf("HEROLTE FG: charger half missing; iOS will not charge\n");
++	}
+ 	return 0;
+ }
+ 
++/* One charger register byte, and a verify-after-write update. */
++static bool
++chg_byte(uint8_t reg, uint8_t *value)
++{
++	uint8_t b;
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (fg_message(CHG_ADDR, false, &reg, 1, false) &&
++		    fg_message(CHG_ADDR, true, &b, 1, true)) {
++			*value = b;
++			return true;
++		}
++		delay(500);
++	}
++	return false;
++}
++
++/* A register write is one fg_message() with both bytes: reg and value in the
++ * same transaction (AUTO_CONF carries the 2-byte count). */
++static bool
++fg_write_reg(uint8_t addr, uint8_t reg, uint8_t value)
++{
++	uint8_t msg[2] = { reg, value };
++	return fg_message(addr, false, msg, 2, true);
++}
++
++/* Read-modify-write with the state logged. */
++static bool
++chg_update(uint8_t reg, uint8_t value, uint8_t mask)
++{
++	uint8_t old;
++	if (!chg_byte(reg, &old)) {
++		return false;
++	}
++	uint8_t b = (uint8_t)((old & ~mask) | (value & mask));
++	if (!fg_write_reg(CHG_ADDR, reg, b)) {
++		printf("HEROLTE CHG: write %#x to CNFG %#x failed\n", b, reg);
++		return false;
++	}
++	uint8_t back;
++	(void)chg_byte(reg, &back);
++	printf("HEROLTE CHG: CNFG %#x %#x -> %#x\n", reg, old, back);
++	return back == b;
++}
++
++/*
++ * HEROLTE charger (Linux max77854_charger_initialize, minus the watchdog,
++ * which needs a userspace kicker XNU has none of). With CHG and BUCK on,
++ * the PMIC charges from VBUS whenever a cable is present; the fuel gauge's
++ * CURRENT then reads positive, which SweetBattery already reports as
++ * "charging". Boot-arg herochg=0 leaves the PMIC as the bootloader had it.
++ */
++int
++herolte_chg_init(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("herochg", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return -1;
++	}
++	uint8_t id;
++	if (!chg_byte(CHG_CNFG_00, &id)) {
++		printf("HEROLTE CHG: no answer at 0x69\n");
++		return -1;
++	}
++	printf("HEROLTE CHG: 0x69 answers, CNFG_00=%#x\n", id);
++	/* Setting-protect unlock (CNFG_06 bits 2-3). */
++	(void)chg_update(CHG_CNFG_06, 0x03 << 2, 0x03 << 2);
++	/* Timers: fast-charge timer, restart threshold and pre-qual charge off
++	 * (CNFG_01), top-off 150 mA / 70 min (CNFG_03), as Linux has them. */
++	(void)chg_update(CHG_CNFG_01, (uint8_t)((0x03 << 4) | 0x08), 0xff);
++	(void)chg_update(CHG_CNFG_03, 0x38, 0xff);
++	/* Charge current 466 mA (CNFG_02 default bits), OTG limit 900 mA (bits 6-7). */
++	(void)chg_update(CHG_CNFG_02, 0x01 << 6, 0xc0);
++	/* BAT-to-SYS OCP 5.00 A (CNFG_05 bits 0-2, as Linux). */
++	(void)chg_update(CHG_CNFG_05, 0x05, 0x07);
++	/* Input current limit (AICR) 500 mA: a plain USB port is the worst case. */
++	(void)chg_update(CHG_CNFG_09, 0x05, 0x7f);
++	/* CHG_EN (0x01) and BUCK (0x04) on, the watchdog (0x08) off: no userspace
++	 * kicker runs under XNU, so it would stop charging minutes in. CNFG_00
++	 * read-back is not stable on this device (0x2, 0xe1, 0x0 across one boot),
++	 * so the write is trusted and DETAILS_01 (0xBA) reports the true state. */
++	(void)chg_update(CHG_CNFG_00, 0x05, 0x0f);
++	uint8_t dtls;
++	if (!chg_byte(CHG_DETAILS_01, &dtls)) {
++		printf("HEROLTE CHG: DETAILS_01 unreadable\n");
++		return -1;
++	}
++	printf("HEROLTE CHG: init done, DETAILS_01=%#x (chg_dtls=%#x)\n",
++	    dtls, (dtls >> 4) & 0x0f);
++	return 0;
++}
++
++/* CHG_DTLS (DETAILS_01 bits 4-7): 1 pre-charge, 2 fast, 3 top-off, 4 done. */
++bool
++herolte_chg_active(void)
++{
++	uint8_t dtls;
++	if (!chg_byte(CHG_DETAILS_01, &dtls)) {
++		return false;
++	}
++	uint8_t chg = (uint8_t)((dtls >> 4) & 0x0f);
++	return chg >= 1 && chg <= 4;
++}
++
+ int
+ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
+ {
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 6d8a0fd..194b611 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
