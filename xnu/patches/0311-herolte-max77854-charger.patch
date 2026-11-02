@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index a0c613a..5a940c7 100644
+index a0c613a..44bc4d8 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,12 +18,17 @@
@@ -65,7 +65,7 @@ index a0c613a..5a940c7 100644
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +208,128 @@ herolte_fg_init(void)
+@@ -192,9 +208,132 @@ herolte_fg_init(void)
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
@@ -100,7 +100,12 @@ index a0c613a..5a940c7 100644
 +	return fg_message(addr, false, msg, 2, true);
 +}
 +
-+/* Read-modify-write with the state logged. */
++/*
++ * Read-modify-write with the state logged. The setting-protect (CNFG_06 bits
++ * 3:2) is re-written before every register: on this PMIC a parameter write
++ * re-locks, and the registers it guards (b0 modes, b2 current, b3 top-off,
++ * b5 OCP) then silently drop the next write (observed in the register dump).
++ */
 +static bool
 +chg_update(uint8_t reg, uint8_t value, uint8_t mask)
 +{
@@ -109,7 +114,8 @@ index a0c613a..5a940c7 100644
 +		return false;
 +	}
 +	uint8_t b = (uint8_t)((old & ~mask) | (value & mask));
-+	if (!fg_write_reg(CHG_ADDR, reg, b)) {
++	if (!fg_write_reg(CHG_ADDR, CHG_CNFG_06, 0x0c) ||
++	    !fg_write_reg(CHG_ADDR, reg, b)) {
 +		printf("HEROLTE CHG: write %#x to CNFG %#x failed\n", b, reg);
 +		return false;
 +	}
@@ -140,8 +146,6 @@ index a0c613a..5a940c7 100644
 +		return -1;
 +	}
 +	printf("HEROLTE CHG: 0x69 answers, CNFG_00=%#x\n", id);
-+	/* Setting-protect unlock (CNFG_06 bits 2-3). */
-+	(void)chg_update(CHG_CNFG_06, 0x03 << 2, 0x03 << 2);
 +	/* Timers: fast-charge timer, restart threshold and pre-qual charge off
 +	 * (CNFG_01), top-off 150 mA / 70 min (CNFG_03), as Linux has them. */
 +	(void)chg_update(CHG_CNFG_01, (uint8_t)((0x03 << 4) | 0x08), 0xff);
@@ -166,7 +170,7 @@ index a0c613a..5a940c7 100644
 +	    dtls, (dtls >> 4) & 0x0f);
 +	/* All registers, twice: one read may catch a NAK (all ones). */
 +	for (uint8_t pass = 0; pass < 2; pass++) {
-+		char line[80];
++		char line[160];
 +		int n = snprintf(line, sizeof(line), "HEROLTE CHG: regs[%u]", pass);
 +		for (uint8_t reg = 0xB0; reg <= 0xC3 && n < (int)sizeof(line) - 6; reg++) {
 +			uint8_t v;
