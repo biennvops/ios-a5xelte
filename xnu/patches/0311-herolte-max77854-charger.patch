@@ -1,4 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index a0c613a..e9acff5 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,12 +18,17 @@
@@ -19,7 +20,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  #define FG_REPCAP       0x05
  #define FG_REPSOC       0x06
  #define FG_VCELL        0x09
-@@ -32,6 +37,16 @@
+@@ -32,6 +37,16 @@ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah,
  /* DTB fuelgauge,capacity_max: Samsung shows 99.0 % of REPSOC as 100 %. */
  #define FG_CAPACITY_MAX 990u
  
@@ -36,7 +37,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  #define HSI2C_CTL       0x00
  #define HSI2C_FIFO_CTL  0x04
  #define HSI2C_TRAILING  0x08
-@@ -89,7 +104,7 @@
+@@ -89,7 +104,7 @@ fg_bus_init(void)
   * Linux i2c-exynos5.c does for every message but the last.
   */
  static bool
@@ -45,7 +46,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  {
  	uint32_t last = 0;
  	bool xfer_done = false;
-@@ -97,7 +112,7 @@
+@@ -97,7 +112,7 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
  
  	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
  	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
@@ -54,7 +55,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
  	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
  	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
-@@ -155,7 +170,7 @@
+@@ -155,7 +170,7 @@ fg_word(uint8_t reg, uint16_t *value)
  {
  	uint8_t b[2];
  	for (unsigned attempt = 0; attempt < 3; attempt++) {
@@ -63,7 +64,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +207,138 @@
+@@ -192,9 +207,138 @@ herolte_fg_init(void)
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
@@ -92,56 +93,56 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
 +/*
 + * One i2c transaction: START, addr+W, reg, value, STOP. Two separate fg_message()
 + * halves would leave the register pointer alone between them (the charger takes
-+ * a value-less write as a null command), so a real write needs this.
++ * a value-less write as a null command), so a real write needs this. One short
++ * attempt: the transfer bit never clears on a NAK, and waiting a long time here
++ * stalls boot (the bus resets below).
 + */
 +static bool
 +fg_write_reg(uint8_t addr, uint8_t reg, uint8_t value)
 +{
 +	uint8_t msg[2] = { reg, value };
-+	uint32_t last = 0;
-+	bool xfer_done = false;
 +	fg_wr(fg_i2c, HSI2C_ADDR, (uint32_t)addr << 10);
 +	fg_wr(fg_i2c, HSI2C_INT_STAT, 0xffffffff);
 +	fg_wr(fg_i2c, HSI2C_INT_EN, 0x10);
 +	unsigned done = 0;
-+	for (unsigned t = 0; t < 10000; t++) {
-+		last = fg_rd(fg_i2c, HSI2C_INT_STAT);
-+		if (last & 0x10) {
-+			fg_wr(fg_i2c, HSI2C_INT_STAT, 0x10);
-+			xfer_done = true;
-+		}
-+		if (xfer_done && !(fg_rd(fg_i2c, HSI2C_TRANS) & (1u << 17))) {
-+			break;
-+		}
++	bool sent = false;
++	for (unsigned t = 0; t < 500; t++) {
 +		if (done < sizeof(msg) && !(fg_rd(fg_i2c, HSI2C_FIFO_STAT) & (1u << 7))) {
 +			fg_wr(fg_i2c, HSI2C_TX_DATA, msg[done++]);
++			continue;
++		}
++		uint32_t last = fg_rd(fg_i2c, HSI2C_INT_STAT);
++		if (last & 0x10) {
++			fg_wr(fg_i2c, HSI2C_INT_STAT, 0x10);
++			sent = true;
++		}
++		if (sent && !(fg_rd(fg_i2c, HSI2C_TRANS) & (1u << 17))) {
++			break;
 +		}
 +		delay(1);
 +	}
 +	fg_wr(fg_i2c, HSI2C_INT_EN, 0);
-+	if (fg_rd(fg_i2c, HSI2C_TRANS) & (1u << 17)) {
-+		fg_bus_init();
-+		return false;
-+	}
-+	return true;
++	fg_bus_init();
++	return sent;
 +}
 +
++/* Read-modify-write with the state logged, one try, no verify loop. */
 +static bool
 +chg_update(uint8_t reg, uint8_t value, uint8_t mask)
 +{
-+	uint8_t old, back;
++	uint8_t old;
 +	if (!chg_byte(reg, &old)) {
 +		return false;
 +	}
 +	uint8_t b = (uint8_t)((old & ~mask) | (value & mask));
-+	for (unsigned attempt = 0; attempt < 3; attempt++) {
-+		if (fg_write_reg(CHG_ADDR, reg, b) &&
-+		    chg_byte(reg, &back) && back == b) {
-+			return true;
-+		}
-+		delay(500);
++	if (!fg_write_reg(CHG_ADDR, reg, b)) {
++		printf("HEROLTE CHG: write %#x to CNFG %#x failed\n", b, reg);
++		return false;
 +	}
-+	return false;
++	uint8_t back;
++	(void)chg_byte(reg, &back);
++	printf("HEROLTE CHG: CNFG %#x %#x -> %#x\n", reg, old, back);
++	return back == b;
 +}
 +
 +/*
@@ -203,6 +204,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
  {
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6d8a0fd..194b611 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -15,6 +15,7 @@
@@ -213,7 +215,7 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
  extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
      unsigned *rem_mah, unsigned *full_mah);
  #define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
-@@ -230,8 +231,9 @@
+@@ -230,8 +231,9 @@ SweetBattery::poll(void)
  		publish(100, 4200, 0, true, true, false, true, false, false);
  		return;
  	}
