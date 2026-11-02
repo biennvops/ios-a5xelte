@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index a0c613a..619a0b1 100644
+index a0c613a..5a940c7 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,12 +18,17 @@
@@ -65,7 +65,7 @@ index a0c613a..619a0b1 100644
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +208,116 @@ herolte_fg_init(void)
+@@ -192,9 +208,128 @@ herolte_fg_init(void)
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
@@ -164,6 +164,18 @@ index a0c613a..619a0b1 100644
 +	}
 +	printf("HEROLTE CHG: init done, DETAILS_01=%#x (chg_dtls=%#x)\n",
 +	    dtls, (dtls >> 4) & 0x0f);
++	/* All registers, twice: one read may catch a NAK (all ones). */
++	for (uint8_t pass = 0; pass < 2; pass++) {
++		char line[80];
++		int n = snprintf(line, sizeof(line), "HEROLTE CHG: regs[%u]", pass);
++		for (uint8_t reg = 0xB0; reg <= 0xC3 && n < (int)sizeof(line) - 6; reg++) {
++			uint8_t v;
++			n += snprintf(line + n, sizeof(line) - n, " %02x=%02x",
++			    reg, chg_byte(reg, &v) ? v : 0xffu);
++		}
++		printf("%s\n", line);
++		delay(100);
++	}
 +	return 0;
 +}
 +
