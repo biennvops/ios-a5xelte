@@ -64,7 +64,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +208,137 @@
+@@ -192,9 +208,145 @@
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
@@ -187,10 +187,18 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
 + * Linux's health read does. Without the kick, charging dies about 128 s in
 + * (observed: positive current at init, negative at the first poll).
 + */
++/*
++ * Called from SweetBattery's poll (every 30 s). Besides reporting whether the
++ * charger says it is busy, the charger's state is REASSERTED: if the watchdog
++ * has reset the charger to its safe defaults (observed: charging dies about
++ * 128 s after boot), the next poll puts the mode back and re-unlocks, so a
++ * dead phone recovers within 30 s instead of staying dead.
++ */
 +bool
 +herolte_chg_active(void)
 +{
-+	(void)fg_write_reg(CHG_ADDR, CHG_CNFG_06, 0x01);
++	(void)fg_write_reg(CHG_ADDR, CHG_CNFG_00, 0x05);
++	(void)fg_write_reg(CHG_ADDR, CHG_CNFG_06, 0x0d);
 +	uint8_t dtls;
 +	if (!chg_byte(CHG_DETAILS_01, &dtls)) {
 +		return false;
