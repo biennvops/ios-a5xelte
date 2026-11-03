@@ -64,28 +64,29 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
-@@ -192,9 +208,145 @@
+@@ -192,10 +208,157 @@
  		return -1;
  	}
  	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
 +	if (herolte_chg_init() != 0) {
 +		printf("HEROLTE FG: charger half missing; iOS will not charge\n");
 +	}
-+	return 0;
-+}
-+
+ 	return 0;
+ }
+ 
 +/* One charger register byte, and a verify-after-write update. */
 +static bool
 +chg_byte(uint8_t reg, uint8_t *value)
 +{
 +	uint8_t b;
-+	for (unsigned attempt = 0; attempt < 3; attempt++) {
++	/* The charger half NAKs while its die runs the charging loop: retry. */
++	for (unsigned attempt = 0; attempt < 10; attempt++) {
 +		if (fg_message(CHG_ADDR, false, &reg, 1, false) &&
 +		    fg_message(CHG_ADDR, true, &b, 1, true)) {
 +			*value = b;
 +			return true;
 +		}
-+		delay(500);
++		delay(10000);
 +	}
 +	return false;
 +}
@@ -131,7 +132,7 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
 + * CURRENT then reads positive, which SweetBattery already reports as
 + * "charging". Boot-arg herochg=0 leaves the PMIC as the bootloader had it.
 + */
-+int
+ int
 +herolte_chg_init(void)
 +{
 +	int enabled = 1;
@@ -176,9 +177,9 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
 +		printf("%s\n", line);
 +		delay(100);
 +	}
- 	return 0;
- }
- 
++	return 0;
++}
++
 +/*
 + * CHG_DTLS (DETAILS_01 bits 4-7): 1 pre-charge, 2 fast, 3 top-off, 4 done.
 + * Called from SweetBattery's poll: the charger's watchdog (WDTEN, left on by
@@ -197,8 +198,18 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
 +bool
 +herolte_chg_active(void)
 +{
-+	(void)fg_write_reg(CHG_ADDR, CHG_CNFG_00, 0x05);
-+	(void)fg_write_reg(CHG_ADDR, CHG_CNFG_06, 0x0d);
++	for (unsigned attempt = 0; attempt < 10; attempt++) {
++		if (fg_write_reg(CHG_ADDR, CHG_CNFG_00, 0x05)) {
++			break;
++		}
++		delay(10000);
++	}
++	for (unsigned attempt = 0; attempt < 10; attempt++) {
++		if (fg_write_reg(CHG_ADDR, CHG_CNFG_06, 0x0d)) {
++			break;
++		}
++		delay(10000);
++	}
 +	uint8_t dtls;
 +	if (!chg_byte(CHG_DETAILS_01, &dtls)) {
 +		return false;
@@ -207,9 +218,10 @@ diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
 +	return chg >= 1 && chg <= 4;
 +}
 +
- int
++int
  herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
  {
+ 	uint16_t soc, vcell, current, rem, full;
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 6d8a0fd..194b611 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
