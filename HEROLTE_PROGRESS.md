@@ -516,3 +516,27 @@ El I2S está en reset hasta `CON_RSTCLR` (+0x00 bit 31); sin eso una escritura t
   protección de escritura de CNFG_00 ligada a CNFG_06 (que también lee 0xff).
 - Siguiente build: volcado de los 20 registros dos veces para distinguir lecturas
   NAK (todo unos) de valores reales.
+
+## Cargador: estado tras 6 iteraciones (0311, sin resolver)
+
+Probado y no suficiente: escrituras de una transacción (corrección necesaria: las
+escrituras en dos transacciones nunca llegaban), bits correctos de CNFG_00 (CHG 0x01,
+BUCK 0x04, WDTEN 0x08 según max77823), unlock de CNFG_06 antes de cada escritura,
+kick del watchdog (unlock+WDTCLR = 0x0d) en cada poll de batería, re-asertar
+CNFG_00=0x05 en cada poll, y 10 reintentos con 10 ms por transacción.
+
+Datos duros: el i2c al 0x69 funciona (b1/b9 verifican dentro de una sesión), el
+cargador ARRANCA al init (corriente positiva, 4307 mV, charging=1) y muere a los
+~128 s; después las lecturas muestran valores por defecto. Las lecturas de CNFG_00
+son inestables (0x2/0xa/0xe1/0x0 en un mismo arranque). b6 y bf leen siempre 0xff
+(probablemente solo-escritura). El medidor (0x36, mismo bus) lee bien siempre.
+
+Hipótesis restantes: (a) el watchdog resetea el cargador y su kick no llega a
+efectivizarse (quizá el bit WDTCLR no es bit0), (b) el M3/APM o la PMU reconfiguran
+el cargador, (c) el cargador requiere la máquina de estados de cable del MUIC
+(detección de tipo de cargador por el M3) para mantener la carga. La (c) es la más
+verosímil: Samsung mantiene `max77854_change_charge_path()` + MUIC constantemente.
+
+**Conclusión práctica:** cargar en TWRP entre sesiones. El teléfono dura ~3.5 h en
+iOS con la batería llena (consumo ~450 mA). El porcentaje de batería y el medidor
+funcionan bien desde iOS. El cargador sigue sin cargar desde XNU.
