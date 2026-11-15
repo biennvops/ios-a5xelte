@@ -73,7 +73,9 @@ static uint64_t submits, faults;
  * kernel zeroes, cleans and maps every new buffer). */
 static struct {
    uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
+   uint64_t sel_calls[8], sel_ns[8];    /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
 } st;
+static const char *const sel_names[8] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo" };
 
 EXPORT void herodrm_log(const char *fmt, ...);
 
@@ -99,6 +101,15 @@ stats_tick(uint64_t t)
                100.0 * st.gpu_us * 1e3 / wall, st.submit_ns / 1e6,
                (unsigned long long)st.creates, st.create_bytes / 1048576.0, st.create_ns / 1e6,
                (unsigned long long)st.frees);
+   char by[512];
+   int used = 0;
+   for (int i = 0; i < 8 && used < (int)sizeof(by) - 48; i++) {
+      if (st.sel_calls[i] && i != 5)
+         used += snprintf(by + used, sizeof(by) - used, " %s %llu/%.1fms", sel_names[i],
+                          (unsigned long long)st.sel_calls[i], st.sel_ns[i] / 1e6);
+   }
+   if (used)
+      herodrm_log("kernel calls %.1f s:%s", wall / 1e9, by);
    memset(&st, 0, sizeof(st));
    st.start_ns = t;
 }
@@ -107,7 +118,12 @@ static uint32_t
 call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nout)
 {
    uint32_t n = nout;
+   uint64_t t0 = now_ns();
    kern_return_t kr = IOConnectCallMethod(conn, sel, in, nin, NULL, 0, out, &n, NULL, NULL);
+   if (sel < 8) {
+      st.sel_calls[sel]++;
+      st.sel_ns[sel] += now_ns() - t0;
+   }
    return kr;
 }
 
@@ -510,8 +526,22 @@ drmIoctl(int fd, unsigned long request, void *arg)
       uint64_t in = p->param, out = 0;
       if (call(SEL_PARAM, &in, 1, &out, 1))
          r = fail(EINVAL);
-      else
+      else {
+         /*
+          * No ASTC (HERO_ASTC=1 keeps it): iOS's own wallpapers come as ASTC
+          * 4x4 and stayed black, the T880 taking them without an error. Without
+          * the bits (20-23: ASTC 3D/2D, LDR/HDR) Panfrost says it has no ASTC
+          * and Mesa decodes every such picture on the CPU as it is uploaded.
+          */
+         if (p->param == DRM_PANFROST_PARAM_TEXTURE_FEATURES0) {
+            const char *a = getenv("HERO_ASTC");
+            if (!a || *a != '1') {
+               herodrm_log("texture features %#llx: ASTC hidden, Mesa decodes it", (unsigned long long)out);
+               out &= ~(0xfull << 20);
+            }
+         }
          p->value = out;
+      }
       break;
    }
    case DRM_IOCTL_PANFROST_CREATE_BO:
