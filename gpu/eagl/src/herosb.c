@@ -57,6 +57,58 @@ give_picture(id window, bool behind_all)
 }
 
 static void
+fix_dock_platter(id platter)
+{
+   if (!platter) return;
+   id layer = send0(platter, "layer");
+   if (layer) {
+      Class color_cls = objc_getClass("UIColor");
+      if (color_cls) {
+         id color = ((id (*)(id, SEL, double, double))objc_msgSend)((id)color_cls,
+            sel_registerName("colorWithWhite:alpha:"), 1.0, 0.35);
+         id cgColor = send0(color, "CGColor");
+         if (cgColor) {
+            ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setBackgroundColor:"), cgColor);
+            ((void (*)(id, SEL, double))objc_msgSend)(layer, sel_registerName("setCornerRadius:"), 26.0);
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, sel_registerName("setMasksToBounds:"), YES);
+         }
+      }
+   }
+   id subviews = send0(platter, "subviews");
+   size_t nsub = subviews ? (size_t)send0(subviews, "count") : 0;
+   for (size_t i = 0; i < nsub; i++) {
+      id sub = ((id (*)(id, SEL, size_t))objc_msgSend)(subviews, sel_registerName("objectAtIndex:"), i);
+      const char *scls = object_getClassName(sub);
+      if (strstr(scls, "Material") || strstr(scls, "Backdrop") || strstr(scls, "VisualEffect")) {
+         ((void (*)(id, SEL, BOOL))objc_msgSend)(sub, sel_registerName("setHidden:"), YES);
+      }
+   }
+}
+
+static void
+fix_dock_views(id view)
+{
+   if (!view) return;
+   const char *cls = object_getClassName(view);
+   if (strstr(cls, "DockView")) {
+      SEL bgSel = sel_registerName("backgroundView");
+      if (class_respondsToSelector(object_getClass(view), bgSel)) {
+         id bg = send0(view, "backgroundView");
+         if (bg) fix_dock_platter(bg);
+      }
+   }
+   if (strstr(cls, "Dock") && (strstr(cls, "Platter") || strstr(cls, "Background"))) {
+      fix_dock_platter(view);
+   }
+   id subviews = send0(view, "subviews");
+   size_t nsub = subviews ? (size_t)send0(subviews, "count") : 0;
+   for (size_t i = 0; i < nsub; i++) {
+      id sub = ((id (*)(id, SEL, size_t))objc_msgSend)(subviews, sel_registerName("objectAtIndex:"), i);
+      fix_dock_views(sub);
+   }
+}
+
+static void
 look_at_windows(void *unused)
 {
    rounds++;
@@ -73,15 +125,17 @@ look_at_windows(void *unused)
    size_t count = windows ? ((size_t (*)(id, SEL))objc_msgSend)(windows, sel_registerName("count")) : 0;
    if (rounds == 1 || rounds == 6)
       herodrm_log("herosb: round %u, %zu windows, picture %d, gestures %d, status bar hooks %d asked %d replaced %d", rounds, count, picture != nil, gestures_on, status_bar_kept, status_bar_asked, status_bar_replaced);
-   for (size_t i = 0; picture && i < count; i++) {
+   for (size_t i = 0; i < count; i++) {
       id window = ((id (*)(id, SEL, size_t))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
       const char *name = object_getClassName(window);
       if (rounds == 6)
          herodrm_log("herosb: window %s", name);
-      if (strstr(name, "Wallpaper"))
+      if (picture && strstr(name, "Wallpaper"))
          give_picture(window, false);
-      else if (strcmp(name, "SBHomeScreenWindow") == 0)
-         give_picture(window, true);
+      else if (strcmp(name, "SBHomeScreenWindow") == 0) {
+         if (picture) give_picture(window, true);
+         fix_dock_views(window);
+      }
    }
    if (rounds < 60)
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, look_at_windows);
