@@ -23,5 +23,7 @@ nvram.txt*
 *.blob
 *.adt
 payload*.bin
+boot*.txt
+boot*.bin
 artifacts/
 .DS_Store
