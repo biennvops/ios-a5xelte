@@ -23,3 +23,5 @@ nvram.txt*
 *.blob
 *.adt
 payload*.bin
+artifacts/
+.DS_Store
