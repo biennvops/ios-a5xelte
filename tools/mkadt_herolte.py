@@ -99,7 +99,7 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, ip
         set_prop(product, 'artwork-device-subtype', mkadt.u32(2208))
         set_prop(product, 'artwork-scale-factor', mkadt.u32(3))
         buttons = child(root, 'buttons')
-        set_prop(buttons, 'home-button-type', mkadt.u32(0))
+        set_prop(buttons, 'home-button-type', mkadt.u32(1))
         set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
                                                    ('volup', 'voldown', 'hold', 'home')))
         canvas = (1242, 2208)
@@ -112,7 +112,7 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, ip
         set_prop(product, 'artwork-device-subtype', mkadt.u32(1334))
         set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
         buttons = child(root, 'buttons')
-        set_prop(buttons, 'home-button-type', mkadt.u32(0))
+        set_prop(buttons, 'home-button-type', mkadt.u32(1))
         set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
                                                    ('volup', 'voldown', 'hold', 'home')))
         canvas = (750, 1334)

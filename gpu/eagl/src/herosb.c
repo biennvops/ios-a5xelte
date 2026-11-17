@@ -148,6 +148,13 @@ look_at_windows(void *unused)
       else if (strcmp(name, "SBHomeScreenWindow") == 0) {
          if (picture) give_picture(window, true);
       }
+      if (strstr(name, "StatusBarWindow")) {
+         id layer = send0(window, "layer");
+         if (layer) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, sel_registerName("setOpaque:"), NO);
+            ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setBackgroundColor:"), nil);
+         }
+      }
       fix_dock_views(window);
    }
    if (rounds < 60)
@@ -292,6 +299,10 @@ report_ranges(void *unused)
 __attribute__((constructor)) static void
 herosb_start(void)
 {
+   setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+   CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+   CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+   CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    if (access(DROP_DIR "fps.off", F_OK) != 0) {
       raise_frame_rates();
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_ranges);
