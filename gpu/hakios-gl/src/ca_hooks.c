@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
+extern void herodrm_log(const char *format, ...);
 void hakios_gl_function_values(void *context, unsigned function, unsigned index, size_t components, size_t count,
     const float *values);
 void hakios_gl_function_refused(unsigned function);
@@ -53,6 +54,7 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	herodrm_log("%s", line);
 }
 
 static void *

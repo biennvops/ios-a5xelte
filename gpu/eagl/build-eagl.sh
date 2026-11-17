@@ -42,7 +42,7 @@ $CC -O2 -g -Wall -c "$HG/src/ca_hooks.c" -o "$OBJ/hg_ca_hooks.o"
 $CC -dynamiclib -o "$OUT/lib/libhakiosgl.dylib" "$OBJ"/{hg_eagl,hg_gl_hero,hg_ca_hooks,hero_log,hero_backboardd,hero_prof}.o \
   -install_name @rpath/libhakiosgl.dylib \
   -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc \
-  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/herolte/lib -Wl,-undefined,error
+  -L "$OUT/lib" -lOSMesa.8 -ldrm.2 -Wl,-rpath,/private/var/herolte/lib -Wl,-undefined,error
 
 # The CoreAnimation test links the SDK's OpenGLES and QuartzCore; EAGL_INJECT_LIB names the shim.
 $CC -O1 -g -Wno-deprecated-declarations -fno-objc-arc -I"$HERE/src" "$HERE/test/eagl_ca_test.m" \

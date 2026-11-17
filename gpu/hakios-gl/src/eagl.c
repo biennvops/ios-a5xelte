@@ -72,6 +72,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
 
 #include "hakios.gl.h"
 
@@ -4421,6 +4422,61 @@ my_dealloc(id self, SEL selector)
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }
 
+static void
+try_install(void)
+{
+	static int done;
+	if (done) {
+		return;
+	}
+	Class class = objc_getClass("EAGLContext");
+	if (class == Nil) {
+		return;
+	}
+	done = 1;
+
+	static const struct {
+		const char *name;
+		IMP ours;
+	} methods[] = {
+		{ "initWithAPI:properties:", (IMP)my_initWithAPI },
+		{ "API", (IMP)my_API },
+		{ "sharegroup", (IMP)my_sharegroup },
+		{ "setParameter:to:", (IMP)my_setParameter },
+		{ "getMacroContextPrivate", (IMP)my_getMacroContextPrivate },
+		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:", (IMP)my_texImageIOSurface },
+		{ "attachImage:toCoreSurface:invertedRender:", (IMP)my_attachImage },
+		{ "dealloc", (IMP)my_dealloc },
+	};
+	unsigned replaced = 0;
+	for (unsigned i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+		SEL selector = sel_registerName(methods[i].name);
+		Method method = class_getInstanceMethod(class, selector);
+
+		if (method == NULL) {
+			say("hakios-gl: EAGLContext has no -%s\n", methods[i].name);
+			continue;
+		}
+		say("hakios-gl: -[EAGLContext %s] (%s) replaced\n", methods[i].name, method_getTypeEncoding(method));
+		if (method == class_getInstanceMethod(class_getSuperclass(class), selector)) {
+			/* inherited: the class gets one of its own, the one it inherits is everybody's */
+			class_addMethod(class, selector, methods[i].ours, method_getTypeEncoding(method));
+		} else {
+			method_setImplementation(method, methods[i].ours);
+		}
+		replaced++;
+	}
+	say("hakios-gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
+	    sizeof(methods) / sizeof(methods[0]), hakios_gl_library());
+}
+
+static void
+on_image_loaded(const struct mach_header *mh, intptr_t slide)
+{
+	(void)mh; (void)slide;
+	try_install();
+}
+
 /* Does the display's driver wait for the GPU before it shows a surface (iokit/Kernel/MiniIOMobileFramebuffer.cpp)? */
 static bool
 display_waits(void)
@@ -4580,27 +4636,6 @@ install(void)
 		}
 	}
 
-	if (class == Nil) {
-		say("hakios-gl: this program has no EAGLContext: nothing to do\n");
-		return;
-	}
-	for (unsigned i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
-		SEL selector = sel_registerName(methods[i].name);
-		Method method = class_getInstanceMethod(class, selector);
-
-		if (method == NULL) {
-			say("hakios-gl: EAGLContext has no -%s\n", methods[i].name);
-			continue;
-		}
-		say("hakios-gl: -[EAGLContext %s] (%s) replaced\n", methods[i].name, method_getTypeEncoding(method));
-		if (method == class_getInstanceMethod(class_getSuperclass(class), selector)) {
-			/* inherited: the class gets one of its own, the one it inherits is everybody's */
-			class_addMethod(class, selector, methods[i].ours, method_getTypeEncoding(method));
-		} else {
-			method_setImplementation(method, methods[i].ours);
-		}
-		replaced++;
-	}
-	say("hakios-gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
-	    sizeof(methods) / sizeof(methods[0]), hakios_gl_library());
+	try_install();
+	_dyld_register_func_for_add_image(on_image_loaded);
 }
