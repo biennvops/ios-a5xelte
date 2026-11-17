@@ -1220,6 +1220,7 @@ int
 main(int main_argc, char **main_argv)
 {
    chmod("/private/var/herolte", 0777);
+   unlink("/private/var/herolte/wallpaper.off");
    if (main_argc > 1 && strcmp(main_argv[1], "--register-apps") == 0)
       return register_apps(main_argc, main_argv);
    disable_bluetooth_audio();

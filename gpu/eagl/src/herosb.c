@@ -57,26 +57,10 @@ give_picture(id window, bool behind_all)
 }
 
 static void
-herosb_file_log(const char *format, ...)
-{
-   char line[256];
-   va_list ap;
-   va_start(ap, format);
-   vsnprintf(line, sizeof(line), format, ap);
-   va_end(ap);
-   FILE *f = fopen(DROP_DIR "herosb.log", "a");
-   if (f) {
-      fputs(line, f);
-      fputc('\n', f);
-      fclose(f);
-   }
-}
-
-static void
 fix_dock_platter(id platter)
 {
    if (!platter) return;
-   herosb_file_log("fixing platter: %s", object_getClassName(platter));
+   herodrm_log("herosb: fixing dock platter: %s", object_getClassName(platter));
    id layer = send0(platter, "layer");
    if (layer) {
       Class color_cls = objc_getClass("UIColor");
@@ -97,6 +81,7 @@ fix_dock_platter(id platter)
          const char *lcls = object_getClassName(slay);
          if (strstr(lcls, "Backdrop") || strstr(lcls, "Material") || strstr(lcls, "Filter")) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(slay, sel_registerName("setHidden:"), YES);
+            ((void (*)(id, SEL, float))objc_msgSend)(slay, sel_registerName("setOpacity:"), 0.0f);
          }
       }
    }
@@ -107,6 +92,7 @@ fix_dock_platter(id platter)
       const char *scls = object_getClassName(sub);
       if (strstr(scls, "Material") || strstr(scls, "Backdrop") || strstr(scls, "VisualEffect")) {
          ((void (*)(id, SEL, BOOL))objc_msgSend)(sub, sel_registerName("setHidden:"), YES);
+         ((void (*)(id, SEL, double))objc_msgSend)(sub, sel_registerName("setAlpha:"), 0.0);
       }
    }
 }
@@ -116,14 +102,14 @@ fix_dock_views(id view)
 {
    if (!view) return;
    const char *cls = object_getClassName(view);
-   if (strstr(cls, "DockView")) {
+   if (strstr(cls, "DockView") || strstr(cls, "SBDock") || strstr(cls, "SBFloatingDock")) {
       SEL bgSel = sel_registerName("backgroundView");
       if (class_respondsToSelector(object_getClass(view), bgSel)) {
          id bg = send0(view, "backgroundView");
          if (bg) fix_dock_platter(bg);
       }
    }
-   if (strstr(cls, "Dock") && (strstr(cls, "Platter") || strstr(cls, "Background"))) {
+   if (strstr(cls, "Dock") && (strstr(cls, "Platter") || strstr(cls, "Background") || strstr(cls, "Material"))) {
       fix_dock_platter(view);
    }
    id subviews = send0(view, "subviews");
@@ -142,7 +128,8 @@ look_at_windows(void *unused)
    SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
    id windows = windows_class && class_respondsToSelector(object_getClass((id)windows_class), all) ?
       ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)windows_class, all, YES, NO) : nil;
-   if (!picture && objc_getClass("UIImage")) {
+   bool wallpaper_on = access(DROP_DIR "wallpaper.off", F_OK) != 0;
+   if (wallpaper_on && !picture && objc_getClass("UIImage")) {
       picture = ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("UIImage"), sel_registerName("imageWithContentsOfFile:"),
          nsstring(DROP_DIR "wallpaper.png"));
       if (picture)
@@ -154,7 +141,6 @@ look_at_windows(void *unused)
    for (size_t i = 0; i < count; i++) {
       id window = ((id (*)(id, SEL, size_t))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
       const char *name = object_getClassName(window);
-      herosb_file_log("window %zu: %s", i, name);
       if (rounds == 6)
          herodrm_log("herosb: window %s", name);
       if (picture && strstr(name, "Wallpaper"))
@@ -312,7 +298,5 @@ herosb_start(void)
    }
    if (access(DROP_DIR "gestures.off", F_OK) != 0)
       ask_for_gestures();
-   if (access(DROP_DIR "wallpaper.off", F_OK) == 0)
-      return;
-   dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, look_at_windows);
+   dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, look_at_windows);
 }
