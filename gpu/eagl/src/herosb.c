@@ -57,9 +57,26 @@ give_picture(id window, bool behind_all)
 }
 
 static void
+herosb_file_log(const char *format, ...)
+{
+   char line[256];
+   va_list ap;
+   va_start(ap, format);
+   vsnprintf(line, sizeof(line), format, ap);
+   va_end(ap);
+   FILE *f = fopen(DROP_DIR "herosb.log", "a");
+   if (f) {
+      fputs(line, f);
+      fputc('\n', f);
+      fclose(f);
+   }
+}
+
+static void
 fix_dock_platter(id platter)
 {
    if (!platter) return;
+   herosb_file_log("fixing platter: %s", object_getClassName(platter));
    id layer = send0(platter, "layer");
    if (layer) {
       Class color_cls = objc_getClass("UIColor");
@@ -71,6 +88,15 @@ fix_dock_platter(id platter)
             ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setBackgroundColor:"), cgColor);
             ((void (*)(id, SEL, double))objc_msgSend)(layer, sel_registerName("setCornerRadius:"), 26.0);
             ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, sel_registerName("setMasksToBounds:"), YES);
+         }
+      }
+      id sublayers = send0(layer, "sublayers");
+      size_t nlay = sublayers ? (size_t)send0(sublayers, "count") : 0;
+      for (size_t i = 0; i < nlay; i++) {
+         id slay = ((id (*)(id, SEL, size_t))objc_msgSend)(sublayers, sel_registerName("objectAtIndex:"), i);
+         const char *lcls = object_getClassName(slay);
+         if (strstr(lcls, "Backdrop") || strstr(lcls, "Material") || strstr(lcls, "Filter")) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(slay, sel_registerName("setHidden:"), YES);
          }
       }
    }
@@ -128,14 +154,15 @@ look_at_windows(void *unused)
    for (size_t i = 0; i < count; i++) {
       id window = ((id (*)(id, SEL, size_t))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
       const char *name = object_getClassName(window);
+      herosb_file_log("window %zu: %s", i, name);
       if (rounds == 6)
          herodrm_log("herosb: window %s", name);
       if (picture && strstr(name, "Wallpaper"))
          give_picture(window, false);
       else if (strcmp(name, "SBHomeScreenWindow") == 0) {
          if (picture) give_picture(window, true);
-         fix_dock_views(window);
       }
+      fix_dock_views(window);
    }
    if (rounds < 60)
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, look_at_windows);
