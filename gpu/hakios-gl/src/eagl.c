@@ -829,7 +829,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	unsigned pixel = bytes_a_pixel(image->format, image->type);
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
-	bool alpha_first = false;
+	bool alpha_first = image->alpha_first && !planar && pixel == 4;
 
 	if (image->shared) {
 		return;
@@ -4387,8 +4387,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * and are not seen. iOS's library has the order from the surface; here it is taken from
 	 * there being no pixel format.
 	 */
-	image->wrapped = pixels == 0;
-	image->alpha_first = false;
+	image->wrapped = image->alpha_first = pixels == 0;
 	image->deep = deep;
 	note_format(deep ? "IOSurface attached, b3a8" : "IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width,
 	    image->height);

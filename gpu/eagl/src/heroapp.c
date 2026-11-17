@@ -240,6 +240,12 @@ heic_census_thread(void *unused)
    return NULL;
 }
 
+static Class
+app_phone_takes_it(id self, SEL cmd, id screen, id info)
+{
+   return objc_getClass("_UIStatusBarVisualProvider_Phone");
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -296,5 +302,15 @@ install(void)
       sel_registerName("handleFailureInMethod:object:file:lineNumber:description:"));
    if (assertion != NULL) {
       assert_original = (void (*)(id, SEL, SEL, id, id, long, id, ...))method_setImplementation(assertion, (IMP)assert_failed);
+   }
+   static const char *const providers[] = { "_UIStatusBarVisualProvider_iOS", "_UIStatusBarVisualProvider_Phone",
+      "_UIStatusBarVisualProvider_Fallback" };
+   SEL pick = sel_registerName("visualProviderSubclassForScreen:visualProviderInfo:");
+   for (size_t i = 0; i < sizeof(providers) / sizeof(providers[0]); i++) {
+      Class provider = objc_getClass(providers[i]);
+      Method method = provider ? class_getClassMethod(provider, pick) : NULL;
+      if (method) {
+         method_setImplementation(method, (IMP)app_phone_takes_it);
+      }
    }
 }
