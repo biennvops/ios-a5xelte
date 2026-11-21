@@ -5,6 +5,7 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
@@ -17,7 +18,6 @@
 typedef struct { double x, y, w, h; } rect_t;
 
 extern void herodrm_log(const char *format, ...);
-extern void NSSetUncaughtExceptionHandler(void (*handler)(id));
 
 static void
 sb_uncaught(id exception)
@@ -360,7 +360,9 @@ report_ranges(void *unused)
 __attribute__((constructor)) static void
 herosb_start(void)
 {
-   NSSetUncaughtExceptionHandler(sb_uncaught);
+   void (*set_uncaught)(void (*)(id)) = (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+   if (set_uncaught)
+      set_uncaught(sb_uncaught);
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
    CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
