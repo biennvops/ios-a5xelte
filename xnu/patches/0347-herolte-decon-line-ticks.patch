@@ -1,0 +1,61 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2640ac4..39b83d4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -201,6 +201,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ public:
+ 	IOTimerEventSource *fShow;      /* a frame goes to the panel as soon as it is given (boot-arg sweetfb_tick=1: at the next tick) */
+ 	uintptr_t     fDecon;           /* DECON_F, for its line counter: where the panel is reading (0: sweetfb_nosync=1) */
++	uint32_t      fLineTicks;       /* calibrated 26 MHz ticks per active DECON line (0 -> SWEET_FB_LINE_TICKS) */
+ 	uint32_t      fVblSent;         /* vsync notifications a client asked for: 0 = CoreAnimation is on its own timer */
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+@@ -615,7 +616,8 @@ AppleCLCD::rearmVsync(IOTimerEventSource *sender)
+ 	uint32_t line = fDecon ? (*(volatile uint32_t *)(fDecon + 0x8c) & 0xffff) : 0;
+ 	if (line != 0 && line <= SWEET_FB_PANEL_LINES) {
+ 		/* The panel is reading: the tick goes with the end of a frame's reading, the panel's own 59.7 Hz. */
+-		uint64_t left = (SWEET_FB_PANEL_LINES - line) * SWEET_FB_LINE_TICKS;
++		uint32_t ticks = fLineTicks ? fLineTicks : SWEET_FB_LINE_TICKS;
++		uint64_t left = (SWEET_FB_PANEL_LINES - line) * (uint64_t)ticks;
+ 		fVsyncNext = now + left + (left < period / 2 ? period : 0);
+ 	} else {
+ 		fVsyncNext += period;
+@@ -645,6 +647,28 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 */
+ 	uint32_t line = fb->fDecon ? (*(volatile uint32_t *)(fb->fDecon + 0x8c) & 0xffff) : 0;
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/*
++	 * Calibrate DECON active ticks/line once vclk is on DISP_PLL (hero2lte's DSC panel scans in ~11.3 ms
++	 * = 115 ticks/line vs herolte's ~14.9 ms = 151; using 151 on hero2lte misses blanking by ~3.4 ms).
++	 */
++	if (fb->fDecon && fb->fLineTicks == 0 && fb->fVsyncCount >= 180 &&
++	    line >= 1 && line < SWEET_FB_PANEL_LINES - 300) {
++		uint64_t t0 = mach_absolute_time();
++		uint32_t l0 = line, l1 = line;
++		for (unsigned i = 0; i < 40 && l1 >= l0 && l1 < l0 + 200; i++) {
++			IODelay(50);
++			l1 = *(volatile uint32_t *)(fb->fDecon + 0x8c) & 0xffff;
++		}
++		if (l1 > l0 + 50 && l1 <= SWEET_FB_PANEL_LINES) {
++			uint32_t t = (uint32_t)((mach_absolute_time() - t0) / (l1 - l0));
++			if (t >= 60 && t <= 240) {
++				fb->fLineTicks = t;
++				IOLog("HEROLTE FB: DECON %u ticks/line (%u us active)\n",
++				    t, (unsigned)(t * SWEET_FB_PANEL_LINES / 26));
++			}
++		}
++		line = l1;
++	}
+ 	/* With two buffers the Mali never draws into the one being read: no waiting for the blank. */
+ 	if (fb->fGpu && (herolte_fb_two_buffers() || notefe_zc_active())) {
+ 		line = 0;       /* (0427) nor with zero copy: VGR0's address is double-buffered (ping-pong) */
+@@ -652,7 +676,8 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ #endif
+ 	if (line != 0 && line < SWEET_FB_PANEL_LINES && sender != NULL) {
+ 		uint64_t ns;
+-		absolutetime_to_nanoseconds((SWEET_FB_PANEL_LINES - line) * SWEET_FB_LINE_TICKS, &ns);
++		uint32_t ticks = fb->fLineTicks ? fb->fLineTicks : SWEET_FB_LINE_TICKS;
++		absolutetime_to_nanoseconds((SWEET_FB_PANEL_LINES - line) * (uint64_t)ticks, &ns);
+ 		sender->setTimeoutUS((uint32_t)(ns / 1000) + 1);
+ 		return;
+ 	}
