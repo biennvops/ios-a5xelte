@@ -17,6 +17,19 @@
 typedef struct { double x, y, w, h; } rect_t;
 
 extern void herodrm_log(const char *format, ...);
+extern void NSSetUncaughtExceptionHandler(void (*handler)(id));
+
+static void
+sb_uncaught(id exception)
+{
+   id name = ((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("name"));
+   id reason = ((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("reason"));
+   id nstr = name ? ((id (*)(id, SEL))objc_msgSend)(name, sel_registerName("description")) : nil;
+   id rstr = reason ? ((id (*)(id, SEL))objc_msgSend)(reason, sel_registerName("description")) : nil;
+   const char *ntext = nstr ? ((const char *(*)(id, SEL))objc_msgSend)(nstr, sel_registerName("UTF8String")) : NULL;
+   const char *rtext = rstr ? ((const char *(*)(id, SEL))objc_msgSend)(rstr, sel_registerName("UTF8String")) : NULL;
+   herodrm_log("SpringBoard: uncaught %s: %s", ntext ? ntext : "(none)", rtext ? rtext : "(none)");
+}
 
 static id
 nsstring(const char *text)
@@ -183,11 +196,45 @@ says_yes(id self, SEL cmd)
  * the red rdar:45025538 fallback. The plain phone's class takes any screen here, and is put in where the fallback
  * still reaches the status bar.
  */
+static struct {
+   Class cls;
+   Method method;
+   Class (*orig)(id, SEL, id, id);
+} pick_hooks[3];
+
+static Class
+concrete_phone_provider(void)
+{
+   Class c = objc_getClass("_UIStatusBarVisualProvider_LegacyPhone");
+   return c ? c : objc_getClass("_UIStatusBarVisualProvider_Phone");
+}
+
 static Class
 phone_takes_it(id self, SEL cmd, id screen, id info)
 {
    status_bar_asked++;
-   return objc_getClass("_UIStatusBarVisualProvider_Phone");
+   Class (*orig)(id, SEL, id, id) = NULL;
+   for (size_t i = 0; i < sizeof(pick_hooks) / sizeof(pick_hooks[0]); i++) {
+      if (pick_hooks[i].cls == (Class)self) {
+         orig = pick_hooks[i].orig;
+         break;
+      }
+   }
+   if (!orig) {
+      for (size_t i = 0; i < sizeof(pick_hooks) / sizeof(pick_hooks[0]); i++) {
+         if (pick_hooks[i].orig) {
+            orig = pick_hooks[i].orig;
+            break;
+         }
+      }
+   }
+   Class c = orig ? orig(self, cmd, screen, info) : Nil;
+   Class fallback = objc_getClass("_UIStatusBarVisualProvider_Fallback");
+   if (c == Nil || (fallback != Nil && c == fallback)) {
+      status_bar_replaced++;
+      return concrete_phone_provider();
+   }
+   return c;
 }
 
 static void (*set_provider_was)(id, SEL, Class);
@@ -197,7 +244,7 @@ set_provider(id self, SEL cmd, Class provider)
 {
    if (provider == objc_getClass("_UIStatusBarVisualProvider_Fallback")) {
       status_bar_replaced++;
-      provider = objc_getClass("_UIStatusBarVisualProvider_Phone");
+      provider = concrete_phone_provider();
    }
    set_provider_was(self, cmd, provider);
 }
@@ -212,8 +259,22 @@ keep_status_bar(void)
       Class provider = objc_getClass(providers[i]);
       Method method = provider ? class_getClassMethod(provider, pick) : NULL;
       if (method) {
-         method_setImplementation(method, (IMP)phone_takes_it);
-         status_bar_kept++;
+         IMP prev = method_getImplementation(method);
+         if (prev != (IMP)phone_takes_it) {
+            pick_hooks[i].cls = provider;
+            pick_hooks[i].method = method;
+            pick_hooks[i].orig = (Class (*)(id, SEL, id, id))method_setImplementation(method, (IMP)phone_takes_it);
+            status_bar_kept++;
+         } else {
+            for (size_t j = 0; j < i; j++) {
+               if (pick_hooks[j].method == method) {
+                  pick_hooks[i].cls = provider;
+                  pick_hooks[i].method = method;
+                  pick_hooks[i].orig = pick_hooks[j].orig;
+                  break;
+               }
+            }
+         }
       }
    }
    Class bar = objc_getClass("_UIStatusBar");
@@ -299,11 +360,11 @@ report_ranges(void *unused)
 __attribute__((constructor)) static void
 herosb_start(void)
 {
+   NSSetUncaughtExceptionHandler(sb_uncaught);
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
    CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-   keep_status_bar();
    if (access(DROP_DIR "fps.off", F_OK) != 0) {
       raise_frame_rates();
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_ranges);

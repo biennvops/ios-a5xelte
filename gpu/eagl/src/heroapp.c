@@ -240,10 +240,37 @@ heic_census_thread(void *unused)
    return NULL;
 }
 
+static struct {
+   Class cls;
+   Method method;
+   Class (*orig)(id, SEL, id, id);
+} app_pick_hooks[3];
+
 static Class
 app_phone_takes_it(id self, SEL cmd, id screen, id info)
 {
-   return objc_getClass("_UIStatusBarVisualProvider_Phone");
+   Class (*orig)(id, SEL, id, id) = NULL;
+   for (size_t i = 0; i < sizeof(app_pick_hooks) / sizeof(app_pick_hooks[0]); i++) {
+      if (app_pick_hooks[i].cls == (Class)self) {
+         orig = app_pick_hooks[i].orig;
+         break;
+      }
+   }
+   if (!orig) {
+      for (size_t i = 0; i < sizeof(app_pick_hooks) / sizeof(app_pick_hooks[0]); i++) {
+         if (app_pick_hooks[i].orig) {
+            orig = app_pick_hooks[i].orig;
+            break;
+         }
+      }
+   }
+   Class c = orig ? orig(self, cmd, screen, info) : Nil;
+   Class fallback = objc_getClass("_UIStatusBarVisualProvider_Fallback");
+   if (c == Nil || (fallback != Nil && c == fallback)) {
+      Class legacy = objc_getClass("_UIStatusBarVisualProvider_LegacyPhone");
+      return legacy ? legacy : objc_getClass("_UIStatusBarVisualProvider_Phone");
+   }
+   return c;
 }
 
 __attribute__((constructor)) static void
@@ -310,7 +337,21 @@ install(void)
       Class provider = objc_getClass(providers[i]);
       Method method = provider ? class_getClassMethod(provider, pick) : NULL;
       if (method) {
-         method_setImplementation(method, (IMP)app_phone_takes_it);
+         IMP prev = method_getImplementation(method);
+         if (prev != (IMP)app_phone_takes_it) {
+            app_pick_hooks[i].cls = provider;
+            app_pick_hooks[i].method = method;
+            app_pick_hooks[i].orig = (Class (*)(id, SEL, id, id))method_setImplementation(method, (IMP)app_phone_takes_it);
+         } else {
+            for (size_t j = 0; j < i; j++) {
+               if (app_pick_hooks[j].method == method) {
+                  app_pick_hooks[i].cls = provider;
+                  app_pick_hooks[i].method = method;
+                  app_pick_hooks[i].orig = app_pick_hooks[j].orig;
+                  break;
+               }
+            }
+         }
       }
    }
 }
