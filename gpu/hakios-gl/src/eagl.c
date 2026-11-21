@@ -689,11 +689,11 @@ surface_shared(struct eagl *e, struct image *image)
  * again (the texture is about to be copied again anyway). A change is seen within eight frames.
  */
 static uint64_t
-rows_sum(const uint8_t *base, size_t row, size_t used, GLsizei height, unsigned phase)
+rows_sum(const uint8_t *base, size_t row, size_t used, GLsizei height, unsigned phase, GLsizei step)
 {
 	uint64_t sum = used ^ phase, word;
 
-	for (GLsizei y = (GLsizei)phase; y < height; y += 8) {
+	for (GLsizei y = (GLsizei)phase; y < height; y += step) {
 		const uint8_t *line = base + row * (size_t)y;
 		for (size_t at = 0; at + 8 <= used; at += 8) {
 			memcpy(&word, line + at, 8);
@@ -720,7 +720,7 @@ surface_changed(struct eagl *e, struct image *image)
 		used = row;
 	}
 	if (image->height <= 256) {
-		uint64_t full_sum = rows_sum(base, row, used, image->height, 0);
+		uint64_t full_sum = rows_sum(base, row, used, image->height, 0, 1);
 		if (image->sums_known && full_sum == image->sum) {
 			return false;
 		}
@@ -729,11 +729,11 @@ surface_changed(struct eagl *e, struct image *image)
 		return true;
 	}
 	unsigned phase = e->frames % 8;
-	if (image->sums_known && rows_sum(base, row, used, image->height, phase) == image->sums[phase]) {
+	if (image->sums_known && rows_sum(base, row, used, image->height, phase, 8) == image->sums[phase]) {
 		return false;
 	}
 	for (unsigned i = 0; i < 8; i++) {
-		image->sums[i] = rows_sum(base, row, used, image->height, i);
+		image->sums[i] = rows_sum(base, row, used, image->height, i, 8);
 	}
 	image->sums_known = true;
 	return true;
@@ -934,6 +934,7 @@ target_to_surface(struct eagl *e, struct image *image)
 	image->drawn = false;
 	if (image->mirror != 0) {
 		GLint read = 0, draw = 0;
+		GLboolean scissored = glIsEnabled(GL_SCISSOR_TEST);
 
 		/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
 		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
@@ -944,12 +945,18 @@ target_to_surface(struct eagl *e, struct image *image)
 		if (e->writer == 0) {
 			glGenFramebuffers(1, &e->writer);
 		}
+		if (scissored) {
+			glDisable(GL_SCISSOR_TEST);
+		}
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
 		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
 		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		if (scissored) {
+			glEnable(GL_SCISSOR_TEST);
+		}
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
@@ -3467,7 +3474,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
-		glDrawArrays(mode, first, count);
+		if (plain || e->program != 0) {
+			glDrawArrays(mode, first, count);
+		}
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
@@ -3507,7 +3516,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
-		glDrawElements(mode, count, type, indices);
+		if (plain || e->program != 0) {
+			glDrawElements(mode, count, type, indices);
+		}
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
@@ -3582,6 +3593,11 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 		group_forget(e, textures[i]);
 		if (textures[i] == e->colour) {
 			e->colour = 0;          /* (a texture that is deleted leaves the framebuffer bound) */
+		}
+		for (unsigned u = 0; u < 8; u++) {
+			if (textures[i] != 0 && e->bound[u] == textures[i]) {
+				e->bound[u] = 0;
+			}
 		}
 	}
 	glDeleteTextures(n, textures);
