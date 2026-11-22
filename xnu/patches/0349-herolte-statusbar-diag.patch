@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 9656621..7ebceda 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2267,6 +2267,37 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	hg_affinity = 1;
+ 	hg_run_nap = false;
+ 	hg_run_quiet = false;
++	{
++		static int fb_test = -1;
++		if (fb_test < 0) {
++			uint32_t t = 0;
++			PE_parse_boot_argn("herofb_test", &t, sizeof(t));
++			fb_test = t ? 1 : 0;
++		}
++		if (ok && fb_test) {
++			static vm_offset_t t_fb1, t_fb2;
++			if (!t_fb1) {
++				extern vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);
++				t_fb1 = notefe_physmap(HG_FB_PA, HG_PANEL_BYTES);
++				t_fb2 = notefe_physmap(HG_FB2_PA, HG_PANEL_BYTES);
++			}
++			vm_offset_t dst = (target_pa == HG_FB2_PA) ? t_fb2 : t_fb1;
++			if (dst) {
++				uint32_t rw_px = small ? HVG_STRIDE_PX : HG_PANEL_W;
++				uint32_t rh_px = small ? h : HG_PANEL_H;
++				uint32_t c_bar = (hgp_frames & 1) ? 0xff343434u : 0xff282828u;
++				uint32_t c_body = (hgp_frames & 1) ? 0xff142c3cu : 0xff102432u;
++				for (uint32_t y = 0; y < rh_px; y++) {
++					volatile uint32_t *row = (volatile uint32_t *)(dst + (uint64_t)y * rw_px * 4);
++					uint32_t col = y < (small ? 45u : 85u) ? c_bar : c_body;
++					for (uint32_t x = 0; x < (small ? w : HG_PANEL_W); x++) {
++						row[x] = col;
++					}
++				}
++				__asm__ volatile ("dsb sy" ::: "memory");
++			}
++		}
++	}
+ 	if (ok && small && hvg_state == 0) {
+ 		/* the first frame for VGR0: into the buffer G1 does not show, then window 0 to VGR0 reading it */
+ 		if (hfb_state == 1) {
+@@ -2279,8 +2310,9 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	} else if (ok && hfb_state == 1 && hg_rd(hfb_idma, 0xb74) != (uint32_t)target_pa) {
+ 		hg_wr(hfb_idma, 0x74, (uint32_t)target_pa);
+ 		hg_wr(hfb_idma, 0x1c, 1);
+-		if (++hfb_flips <= 3 || hfb_flips % 3000 == 0) {
+-			printf("HEROLTE FB2: flip %llu to %#llx\n", hfb_flips, target_pa);
++		if (++hfb_flips <= 5 || hfb_flips % 1000 == 0) {
++			printf("HEROLTE FB2: flip %llu to %#llx (decon irq %#x idma irq %#x)\n",
++			    hfb_flips, target_pa, hvg_decon ? hg_rd(hvg_decon, 0x48) : 0, hg_rd(hfb_idma, 0x04));
+ 		}
+ 	}
+ 	if (++hgp_frames <= 3 || !ok) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 39b83d4..444b685 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1172,6 +1172,59 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		if (src != 0 && bpe == 4 && h >= 120) {
++			static int sbchk = -1;
++			if (sbchk < 0) {
++				uint32_t v = 1;
++				PE_parse_boot_argn("herosbchk", &v, sizeof(v));
++				sbchk = v ? 1 : 0;
++			}
++			if (sbchk) {
++				static uint64_t sb_count, sb_hits;
++				static uint32_t sb_peak;
++				uint32_t max_w = 0, max_y = 0, white_rows = 0, ctrl_w = 0;
++				uintptr_t base = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++				for (int32_t row = 0; row < 45; row++) {
++					const uint32_t *p = (const uint32_t *)(base + (uint64_t)row * s->bytesPerRow);
++					uint32_t cnt = 0;
++					for (int32_t x = 0; x < w; x++) {
++						uint32_t px = p[x];
++						if (((px >> 16) & 0xff) > 235 && ((px >> 8) & 0xff) > 235 && (px & 0xff) > 235) {
++							cnt++;
++						}
++					}
++					if (cnt > max_w) {
++						max_w = cnt;
++						max_y = (uint32_t)row;
++					}
++					if (cnt >= 180) {
++						white_rows++;
++					}
++				}
++				const uint32_t *cp = (const uint32_t *)(base + 100ULL * s->bytesPerRow);
++				for (int32_t x = 0; x < w; x++) {
++					uint32_t px = cp[x];
++					if (((px >> 16) & 0xff) > 235 && ((px >> 8) & 0xff) > 235 && (px & 0xff) > 235) {
++						ctrl_w++;
++					}
++				}
++				if (max_w > sb_peak) {
++					sb_peak = max_w;
++				}
++				sb_count++;
++				if (max_w >= 180) {
++					sb_hits++;
++					if (sb_hits <= 25 || (sb_hits % 50) == 0) {
++						IOLog("HEROLTE SBCHK: swap %llu white_rows=%u max=%u at y=%u (ctrl y100=%u)\n",
++						    sb_count, white_rows, max_w, max_y, ctrl_w);
++					}
++				}
++				if ((sb_count % 300) == 0) {
++					IOLog("HEROLTE SBCHK: summary swaps=%llu hits=%llu peak_white_px=%u\n",
++					    sb_count, sb_hits, sb_peak);
++				}
++			}
++		}
+ 		/* (0425) zero copy: a whole frame in memory the display can read goes to VGR0 as it is. */
+ 		if (src != 0 && bpe == 4 && fGpu && dx == 0 && dy == 0 && sx == 0 && sy == 0 && !fPowerOff &&
+ 		    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH && s->pixelFormat == SWEET_FB_FORMAT_BGRA) {
