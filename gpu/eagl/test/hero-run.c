@@ -1221,6 +1221,14 @@ main(int main_argc, char **main_argv)
 {
    chmod("/private/var/herolte", 0777);
    unlink("/private/var/herolte/wallpaper.off");
+   if (access(DROP_DIR "poster.clean", F_OK) == 0) {
+      int rm = remove_tree("/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore");
+      unlink(DROP_DIR "poster.clean");
+      herodrm_log("hero-run: PRBPosterExtensionDataStore cleaned (%d), restarting PosterBoard/SpringBoard", rm);
+      kill_by_name("PosterBoard", SIGKILL);
+      kill_by_name("CollectionsPoster", SIGKILL);
+      kill_by_name("SpringBoard", SIGKILL);
+   }
    if (main_argc > 1 && strcmp(main_argv[1], "--register-apps") == 0)
       return register_apps(main_argc, main_argv);
    disable_bluetooth_audio();

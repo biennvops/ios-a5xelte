@@ -10,6 +10,7 @@
  */
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
@@ -103,10 +104,6 @@ assert_failed(id self, SEL command, SEL method, id object, id file, long line, i
  */
 typedef struct { double x, y, w, h; } hero_rect;
 typedef struct { double w, h; } hero_size;
-extern void UIGraphicsBeginImageContextWithOptions(hero_size size, bool opaque, double scale);
-extern void *UIGraphicsGetCurrentContext(void);
-extern id UIGraphicsGetImageFromCurrentImageContext(void);
-extern void UIGraphicsEndImageContext(void);
 #include <CoreGraphics/CoreGraphics.h>
 
 static id
@@ -116,11 +113,17 @@ preview_for_view(id self, SEL command, id view)
    (void)command;
    if (view == nil)
       return nil;
+   void (*begin_ctx)(hero_size, bool, double) = (void (*)(hero_size, bool, double))dlsym(RTLD_DEFAULT, "UIGraphicsBeginImageContextWithOptions");
+   void *(*get_ctx)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "UIGraphicsGetCurrentContext");
+   id (*get_img)(void) = (id (*)(void))dlsym(RTLD_DEFAULT, "UIGraphicsGetImageFromCurrentImageContext");
+   void (*end_ctx)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "UIGraphicsEndImageContext");
+   if (!begin_ctx || !get_ctx || !get_img || !end_ctx)
+      return nil;
    hero_rect bounds = ((hero_rect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
    if (bounds.w <= 0 || bounds.h <= 0)
       return nil;
-   UIGraphicsBeginImageContextWithOptions((hero_size){ bounds.w, bounds.h }, false, 2.0);
-   void *context = UIGraphicsGetCurrentContext();
+   begin_ctx((hero_size){ bounds.w, bounds.h }, false, 2.0);
+   void *context = get_ctx();
    if (context != NULL) {
       /*
        * (2026-11-14) -renderInContext: draws only this process's layers: the posters are drawn by their extensions
@@ -146,8 +149,8 @@ preview_for_view(id self, SEL command, id view)
          ((void (*)(id, SEL, void *))objc_msgSend)(layer, sel_registerName("renderInContext:"), context);
       }
    }
-   id image = UIGraphicsGetImageFromCurrentImageContext();
-   UIGraphicsEndImageContext();
+   id image = get_img();
+   end_ctx();
    return image;
 }
 
@@ -273,12 +276,42 @@ app_phone_takes_it(id self, SEL cmd, id screen, id info)
    return c;
 }
 
+static void
+no_prewarm_portrait(id self, SEL cmd, int version, BOOL styles)
+{
+   (void)self;
+   (void)cmd;
+   (void)version;
+   (void)styles;
+}
+
+static void
+media_image_added(const struct mach_header *header, intptr_t slide)
+{
+   static bool done;
+   (void)header;
+   (void)slide;
+   if (done)
+      return;
+   Class cls = objc_getClass("BWCoreImageFilterRenderer");
+   if (cls == Nil)
+      return;
+   done = true;
+   Method m = class_getClassMethod(cls, sel_registerName("prewarmPortraitFilterVersion:semanticStyleFilters:"));
+   if (m != NULL) {
+      method_setImplementation(m, (IMP)no_prewarm_portrait);
+      herodrm_log("mediaserverd: +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] disabled");
+   }
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
    /*
     * The front camera's capture device (gpu/camera, libnotefecam.dylib; the Note FE port's 0458) in mediaserverd only,
     * with the drop zone's cam.media = 1. hero-run makes /dev/hakios-camera (kern.notefe_cam=7) and restarts mediaserverd.
+    * Even with cam.media = 0, MobileGestalt's cache may still have still-camera = true from an earlier boot, which makes
+    * CMCapture prewarm BWCoreImageFilterRenderer on Metal/GL and jump to address 0 every 10 s.
     */
    if (strcmp(getprogname(), "mediaserverd") == 0) {
       char flag = '0';
@@ -290,7 +323,10 @@ install(void)
       if (flag == '1' && access("/private/var/herolte/lib/libnotefecam.dylib", F_OK) == 0) {
          void *cam = dlopen("/private/var/herolte/lib/libnotefecam.dylib", RTLD_NOW);
          herodrm_log("mediaserverd: libnotefecam %s", cam ? "loaded" : dlerror());
+      } else {
+         _dyld_register_func_for_add_image(media_image_added);
       }
+      return;
    }
    if (strcmp(getprogname(), "CollectionsPoster") == 0) {
       pthread_t census;
@@ -305,7 +341,9 @@ install(void)
       }
       herodrm_log("PosterBoard: home preview in a bitmap: %d", preview != NULL);
    }
-   NSSetUncaughtExceptionHandler(uncaught);
+   void (*set_uncaught)(void (*)(id)) = (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+   if (set_uncaught)
+      set_uncaught(uncaught);
    dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY);
    Class context = objc_getClass("EAGLContext");
    if (context != Nil) {

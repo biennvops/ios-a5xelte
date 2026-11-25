@@ -56,7 +56,7 @@ $CC -O2 -Wall -dynamiclib -o "$OUT/lib/libherosb.dylib" "$HERE/src/herosb.c" -in
   -framework CoreFoundation -lobjc -L "$OUT/lib" -ldrm.2 -Wl,-rpath,/private/var/herolte/lib
 
 $CC -O2 -Wall -dynamiclib -o "$OUT/lib/libheroapp.dylib" "$HERE/src/heroapp.c" -install_name @rpath/libheroapp.dylib \
-  -framework Foundation -framework UIKit -framework CoreGraphics -framework ImageIO -framework IOSurface \
+  -framework Foundation -framework CoreGraphics -framework ImageIO -framework IOSurface \
   -lobjc -L "$OUT/lib" -ldrm.2 -Wl,-rpath,/private/var/herolte/lib
 
 # The front camera's capture device in mediaserverd (gpu/camera, from the Note FE port's gracerlte/camera, after the S9

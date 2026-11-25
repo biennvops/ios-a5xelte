@@ -141,7 +141,7 @@ look_at_windows(void *unused)
    SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
    id windows = windows_class && class_respondsToSelector(object_getClass((id)windows_class), all) ?
       ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)windows_class, all, YES, NO) : nil;
-   bool wallpaper_on = access(DROP_DIR "wallpaper.off", F_OK) != 0;
+   bool wallpaper_on = access(DROP_DIR "wallpaper.on", F_OK) == 0;
    if (wallpaper_on && !picture && objc_getClass("UIImage")) {
       picture = ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("UIImage"), sel_registerName("imageWithContentsOfFile:"),
          nsstring(DROP_DIR "wallpaper.png"));
@@ -170,15 +170,10 @@ look_at_windows(void *unused)
       }
       fix_dock_views(window);
    }
-   if (rounds < 60)
+   if (rounds < 6)
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, look_at_windows);
 }
 
-/*
- * The ADT says "home button" (home-button-type 1): UIKit then has a status bar for this 750x1334 screen, where type 2
- * gets the red rdar:45025538 one. SpringBoard alone is told type 2, which is where the home gestures are decided, as
- * the old home-gesture tweaks did. DROP_DIR gestures.off turns it off.
- */
 static long
 says_gestures(id self, SEL cmd)
 {
@@ -191,11 +186,6 @@ says_yes(id self, SEL cmd)
    return YES;
 }
 
-/*
- * ...but told type 2, UIKit in SpringBoard asks each provider class in turn, none takes a 750x1334 screen and it ends on
- * the red rdar:45025538 fallback. The plain phone's class takes any screen here, and is put in where the fallback
- * still reaches the status bar.
- */
 static struct {
    Class cls;
    Method method;
