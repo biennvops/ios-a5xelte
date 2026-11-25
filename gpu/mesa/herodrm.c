@@ -58,6 +58,7 @@ enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFAC
 struct hbo {
    uint64_t va, size;
    uint64_t cpu;
+   bool pooled;
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -255,15 +256,92 @@ heap_cap(void)
    return (mb ? mb : 32) << 20;
 }
 
+static bool async_on;
+static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
+static void queue_drain(void);
+static bool bo_busy(uint32_t handle);
+static void bo_wait(uint32_t handle);
+
+/*
+ * Userspace pool for recently-freed small non-surface BOs (<= 256 KB, up to 8 MB total).
+ * Avoids repeated kernel page allocation, zeroing, CPU cache cleaning and Mali MMU flushes
+ * when Control Center / CoreAnimation churns transient batch and texture BOs.
+ */
+#define BO_POOL_MAX       64
+#define BO_POOL_ITEM_MAX  (256u * 1024u)
+#define BO_POOL_BYTES_MAX (8u * 1024u * 1024u)
+static uint32_t bo_pool[BO_POOL_MAX];
+static unsigned bo_pool_count;
+static uint64_t bo_pool_bytes;
+
+static void
+bo_pool_flush(void)
+{
+   while (bo_pool_count > 0) {
+      uint32_t h = bo_pool[--bo_pool_count];
+      bo_pool_bytes -= bos[h].size;
+      bo_wait(h);
+      bo_last_job[h] = 0;
+      uint64_t in = h;
+      call(SEL_FREE, &in, 1, NULL, 0);
+      st.frees++;
+      memset(&bos[h], 0, sizeof(bos[h]));
+   }
+}
+
+static uint32_t
+bo_pool_take(uint64_t page_size)
+{
+   for (unsigned i = 0; i < bo_pool_count; i++) {
+      uint32_t h = bo_pool[i];
+      if (bos[h].size == page_size && !bo_busy(h)) {
+         bo_pool[i] = bo_pool[--bo_pool_count];
+         bo_pool_bytes -= bos[h].size;
+         bos[h].pooled = false;
+         if (!bos[h].cpu) {
+            uint64_t in = h, out = 0;
+            if (call(SEL_MAP, &in, 1, &out, 1) == 0)
+               bos[h].cpu = out;
+         }
+         if (bos[h].cpu) {
+            memset((void *)(uintptr_t)bos[h].cpu, 0, (size_t)bos[h].size);
+            __asm__ volatile ("dsb sy" ::: "memory");
+            return h;
+         }
+         /* Could not map to zero: fall back to kernel free. */
+         uint64_t in = h;
+         call(SEL_FREE, &in, 1, NULL, 0);
+         st.frees++;
+         memset(&bos[h], 0, sizeof(bos[h]));
+         return 0;
+      }
+   }
+   return 0;
+}
+
 static int
 create_bo(struct drm_panfrost_create_bo *req)
 {
    uint64_t size = req->size;
    if (req->flags & PANFROST_BO_HEAP && size > heap_cap())
       size = heap_cap();
+   uint64_t aligned = (size + 0xfffull) & ~0xfffull;
+   if (!(req->flags & PANFROST_BO_HEAP) && aligned > 0 && aligned <= BO_POOL_ITEM_MAX) {
+      uint32_t reused = bo_pool_take(aligned);
+      if (reused) {
+         req->handle = reused;
+         req->offset = bos[reused].va;
+         req->size = (uint32_t)bos[reused].size;
+         return 0;
+      }
+   }
    uint64_t in = size, out[3] = {0};
    uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
+   if ((kr || out[0] == 0 || out[0] > MAX_BOS) && bo_pool_count > 0) {
+      bo_pool_flush();
+      kr = call(SEL_CREATE, &in, 1, out, 3);
+   }
    uint64_t t1 = now_ns();
    st.creates++;
    st.create_bytes += size;
@@ -288,30 +366,34 @@ create_bo(struct drm_panfrost_create_bo *req)
 static struct hbo *
 lookup(uint32_t handle)
 {
-   return handle && handle <= MAX_BOS && bos[handle].va ? &bos[handle] : NULL;
+   return handle && handle <= MAX_BOS && bos[handle].va && !bos[handle].pooled ? &bos[handle] : NULL;
 }
-
-static bool async_on;
-static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
-static void queue_drain(void);
-static void bo_wait(uint32_t handle);
 
 static int
 free_bo(uint32_t handle)
 {
    if (!lookup(handle))
       return fail(EINVAL);
+   bool is_prime = false;
+   for (int i = 0; i < MAX_PRIME; i++)
+      if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
+         close(primes[i].fd);
+         primes[i].handle = 0;
+         is_prime = true;
+      }
+   if (!is_prime && bos[handle].size <= BO_POOL_ITEM_MAX &&
+       bo_pool_count < BO_POOL_MAX && bo_pool_bytes + bos[handle].size <= BO_POOL_BYTES_MAX) {
+      bos[handle].pooled = true;
+      bo_pool[bo_pool_count++] = handle;
+      bo_pool_bytes += bos[handle].size;
+      return 0;
+   }
    bo_wait(handle);
    bo_last_job[handle] = 0;
    uint64_t in = handle;
    call(SEL_FREE, &in, 1, NULL, 0);
    st.frees++;
    memset(&bos[handle], 0, sizeof(bos[handle]));
-   for (int i = 0; i < MAX_PRIME; i++)
-      if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
-         close(primes[i].fd);
-         primes[i].handle = 0;
-      }
    DBG("FREE_BO %u", handle);
    return 0;
 }

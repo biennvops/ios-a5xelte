@@ -257,6 +257,8 @@ struct eagl {
 	unsigned long api;
 	struct image images[IMAGE_MAX];
 	uint16_t image_slot[IMAGE_INDEX_MAX];   /* texture -> index in images[] + 1 (0 = none), O(1) lookup */
+	uint16_t tex_w[IMAGE_INDEX_MAX];        /* cached texture dimensions for fast clear/group checks */
+	uint16_t tex_h[IMAGE_INDEX_MAX];
 	unsigned image_count;
 	GLuint fbo_tag[FBO_CACHE_MAX];          /* direct-mapped FBO -> colour attachment cache */
 	GLuint fbo_colour[FBO_CACHE_MAX];
@@ -1521,7 +1523,10 @@ my_glClear(void *context, GLbitfield mask)
 		}
 	}
 	struct image *target_img = e->colour != 0 ? image_of(e, e->colour) : NULL;
-	if (e->colour != 0 && (target_img == NULL || !target_img->target)) {
+	bool may_vblur = vblur_on && e->colour != 0 && (target_img == NULL || !target_img->target) &&
+	    (e->colour >= IMAGE_INDEX_MAX || e->tex_w[e->colour] == 0 ||
+	    (e->tex_w[e->colour] >= 300 && e->tex_h[e->colour] >= 400));
+	if (may_vblur) {
 		/* what is about to be cleared may be what the next draw reads: see reads_what_it_writes() */
 		e->unclear = mask;
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
@@ -3046,11 +3051,17 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 	    (into->state == GROUP_VIBRANT && memcmp(into->colours, function_values[function], sizeof(into->colours)) == 0))) {
 		/* a vibrant layer drawn into a group with nothing in it: its coverage */
 		GLint width = 1, height = 1;
+		GLuint t0 = e->bound[0];
 
-		glActiveTexture(GL_TEXTURE0);
-		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
-		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
-		glActiveTexture(GL_TEXTURE0 + e->unit);
+		if (t0 < IMAGE_INDEX_MAX && e->tex_w[t0] != 0 && e->tex_h[t0] != 0) {
+			width = e->tex_w[t0];
+			height = e->tex_h[t0];
+		} else {
+			glActiveTexture(GL_TEXTURE0);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
+		}
 		texmat[0] = 1.f / (GLfloat)(width > 0 ? width : 1);
 		texmat[1] = 1.f / (GLfloat)(height > 0 ? height : 1);
 		memcpy(matrix, e->matrix != NULL ? e->matrix : identity, sizeof(matrix));
@@ -3628,6 +3639,10 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 		image_forget(e, textures[i]);
 		vblur_forget(e, textures[i]);
 		group_forget(e, textures[i]);
+		if (textures[i] < IMAGE_INDEX_MAX) {
+			e->tex_w[textures[i]] = 0;
+			e->tex_h[textures[i]] = 0;
+		}
 		if (textures[i] == e->colour) {
 			e->colour = 0;          /* (a texture that is deleted leaves the framebuffer bound) */
 		}
@@ -3721,7 +3736,12 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	}
 	clear_now(e);
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
-		group_forget(e, e->bound[e->unit]);
+		GLuint t = e->bound[e->unit];
+		group_forget(e, t);
+		if (level == 0 && t < IMAGE_INDEX_MAX) {
+			e->tex_w[t] = (uint16_t)(width > 0 && width <= 0xffff ? width : 0);
+			e->tex_h[t] = (uint16_t)(height > 0 && height <= 0xffff ? height : 0);
+		}
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
