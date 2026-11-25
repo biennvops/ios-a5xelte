@@ -246,13 +246,20 @@ struct image {
 	GLsizei width, height;
 };
 
+#define IMAGE_MAX       4096
+#define IMAGE_INDEX_MAX 8192
+#define FBO_CACHE_MAX   4096
+
 struct eagl {
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
+	struct image images[IMAGE_MAX];
+	uint16_t image_slot[IMAGE_INDEX_MAX];   /* texture -> index in images[] + 1 (0 = none), O(1) lookup */
 	unsigned image_count;
+	GLuint fbo_tag[FBO_CACHE_MAX];          /* direct-mapped FBO -> colour attachment cache */
+	GLuint fbo_colour[FBO_CACHE_MAX];
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
@@ -344,7 +351,7 @@ static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
-static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
+static int check_errors = 0;            /* boot-arg glerrors=1: ask the library for an error after every call */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
@@ -553,6 +560,10 @@ summary(struct eagl *e)
 static struct image *
 image_of(struct eagl *e, GLuint texture)
 {
+	if (texture < IMAGE_INDEX_MAX) {
+		uint16_t slot = e->image_slot[texture];
+		return slot != 0 ? &e->images[slot - 1] : NULL;
+	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].texture == texture) {
 			return &e->images[i];
@@ -571,7 +582,11 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
 			return NULL;
 		}
-		image = &e->images[e->image_count++];
+		unsigned idx = e->image_count++;
+		image = &e->images[idx];
+		if (texture < IMAGE_INDEX_MAX) {
+			e->image_slot[texture] = (uint16_t)(idx + 1);
+		}
 	} else {
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
@@ -590,11 +605,21 @@ image_forget(struct eagl *e, GLuint texture)
 	struct image *image = image_of(e, texture);
 
 	if (image != NULL) {
+		unsigned idx = (unsigned)(image - e->images);
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
 		CFRelease(image->surface);
-		*image = e->images[--e->image_count];
+		if (texture < IMAGE_INDEX_MAX) {
+			e->image_slot[texture] = 0;
+		}
+		unsigned last = --e->image_count;
+		if (idx != last) {
+			*image = e->images[last];
+			if (image->texture < IMAGE_INDEX_MAX) {
+				e->image_slot[image->texture] = (uint16_t)(idx + 1);
+			}
+		}
 	}
 }
 
@@ -1495,7 +1520,8 @@ my_glClear(void *context, GLbitfield mask)
 			g->state = GROUP_FRESH;         /* (a group about to be drawn: see group_draw_begin()) */
 		}
 	}
-	if (e->colour != 0) {
+	struct image *target_img = e->colour != 0 ? image_of(e, e->colour) : NULL;
+	if (e->colour != 0 && (target_img == NULL || !target_img->target)) {
 		/* what is about to be cleared may be what the next draw reads: see reads_what_it_writes() */
 		e->unclear = mask;
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
@@ -3902,14 +3928,21 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 	e->framebuffer = framebuffer;
 	e->colour = 0;
 	if (framebuffer != 0) {
-		GLint kind = 0, name = 0;
+		unsigned slot = framebuffer % FBO_CACHE_MAX;
+		if (e->fbo_tag[slot] == framebuffer) {
+			e->colour = e->fbo_colour[slot];
+		} else {
+			GLint kind = 0, name = 0;
 
-		glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
-		if (kind == GL_TEXTURE) {
 			glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-			e->colour = (GLuint)name;
+			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+			if (kind == GL_TEXTURE) {
+				glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+				e->colour = (GLuint)name;
+			}
+			e->fbo_tag[slot] = framebuffer;
+			e->fbo_colour[slot] = e->colour;
 		}
 	}
 	EAGL_LEAVE(e, 0x1508);
@@ -3924,6 +3957,11 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
 		e->colour = texture;
+		if (e->framebuffer != 0) {
+			unsigned slot = e->framebuffer % FBO_CACHE_MAX;
+			e->fbo_tag[slot] = e->framebuffer;
+			e->fbo_colour[slot] = texture;
+		}
 	}
 	if (eagl_tracing) {
 		eagl_trace("glFramebufferTexture2D(%#x, %#x, %#x, %u, %d)\n", target, attachment, to, texture, level);
@@ -3940,6 +3978,12 @@ my_glDeleteFramebuffers(void *context, GLsizei n, const GLuint *framebuffers)
 	EAGL_ENTER(e, 0x1510);
 	clear_now(e);
 	for (GLsizei i = 0; i < n; i++) {
+		if (framebuffers[i] != 0) {
+			unsigned slot = framebuffers[i] % FBO_CACHE_MAX;
+			if (e->fbo_tag[slot] == framebuffers[i]) {
+				e->fbo_tag[slot] = 0;
+			}
+		}
 		if (framebuffers[i] == e->framebuffer) {
 			e->framebuffer = e->colour = 0;
 		}
@@ -4655,6 +4699,7 @@ install(void)
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		sync_display_targets = strstr(arguments, "glsyncbo=1") != NULL;
+		check_errors = strstr(arguments, "glerrors=1") != NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}
