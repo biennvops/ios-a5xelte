@@ -228,6 +228,7 @@ struct image {
 	IOSurfaceRef surface;
 	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
 	bool synced_pending;            /* (Galaxy S7 port) the GPU has copied into the surface: hakios_gl_surface_written() due */
+	bool target_synced;             /* full-screen display target already synced once; GPU present reads DRAM directly */
 	bool invert, drawn;
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
@@ -365,6 +366,7 @@ static int blit_targets = 1;
  */
 static int wait_for_frames = 1;
 static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
+static int sync_display_targets = 0;    /* boot-arg glsyncbo=1: dc civac full-screen targets every frame (GPU present does not need it) */
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
@@ -1223,7 +1225,7 @@ frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
-	unsigned copied = 0, in_place = 0;
+	unsigned copied = 0, in_place = 0, blitted = 0;
 
 	clear_now(e);
 	before = now_us();
@@ -1232,13 +1234,14 @@ frame_end(struct eagl *e, bool finished)
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
 			e->images[i].synced_pending = true;
 			in_place++;
+			blitted++;
 			glFlush();                              /* (also after a glFinish: the copy is new since) */
 		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
 			in_place++;
 		}
 	}
-	if (in_place != 0 && !finished && wait_for_frames) {
+	if ((blitted != 0 || (in_place != 0 && !finished)) && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames) {
 		/*
@@ -1260,11 +1263,19 @@ frame_end(struct eagl *e, bool finished)
 	for (unsigned i = 0; i < e->image_count; i++) {
 		/* (Galaxy S7 port) the GPU's copy is in the surface's memory: out of the CPU's caches, for the display */
 		if (e->images[i].target && e->images[i].mirror != 0 && e->images[i].synced_pending) {
+			bool display_surf = e->images[i].width >= 700 && e->images[i].height >= 1000;
 			e->images[i].synced_pending = false;
-			hakios_gl_surface_written(e->gl, IOSurfaceGetID(e->images[i].surface));
+			if (sync_display_targets || !display_surf || !e->images[i].target_synced) {
+				hakios_gl_surface_written(e->gl, IOSurfaceGetID(e->images[i].surface));
+				e->images[i].target_synced = true;
+			}
 		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
-			hakios_gl_surface_written(e->gl, IOSurfaceGetID(e->images[i].surface));
+			bool display_surf = e->images[i].width >= 700 && e->images[i].height >= 1000;
+			if (sync_display_targets || !display_surf || !e->images[i].target_synced) {
+				hakios_gl_surface_written(e->gl, IOSurfaceGetID(e->images[i].surface));
+				e->images[i].target_synced = true;
+			}
 		}
 	}
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -4643,6 +4654,7 @@ install(void)
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
+		sync_display_targets = strstr(arguments, "glsyncbo=1") != NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}

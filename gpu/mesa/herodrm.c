@@ -51,7 +51,7 @@ kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO };
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO, SEL_SUBMIT_BATCH };
 
 #define MAX_BOS 4096
 
@@ -73,9 +73,9 @@ static uint64_t submits, faults;
  * kernel zeroes, cleans and maps every new buffer). */
 static struct {
    uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
-   uint64_t sel_calls[8], sel_ns[8];    /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
+   uint64_t sel_calls[9], sel_ns[9];    /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
 } st;
-static const char *const sel_names[8] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo" };
+static const char *const sel_names[9] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo", "batch" };
 
 EXPORT void herodrm_log(const char *fmt, ...);
 
@@ -103,7 +103,7 @@ stats_tick(uint64_t t)
                (unsigned long long)st.frees);
    char by[512];
    int used = 0;
-   for (int i = 0; i < 8 && used < (int)sizeof(by) - 48; i++) {
+   for (int i = 0; i < 9 && used < (int)sizeof(by) - 48; i++) {
       if (st.sel_calls[i] && i != 5)
          used += snprintf(by + used, sizeof(by) - used, " %s %llu/%.1fms", sel_names[i],
                           (unsigned long long)st.sel_calls[i], st.sel_ns[i] / 1e6);
@@ -120,7 +120,7 @@ call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nou
    uint32_t n = nout;
    uint64_t t0 = now_ns();
    kern_return_t kr = IOConnectCallMethod(conn, sel, in, nin, NULL, 0, out, &n, NULL, NULL);
-   if (sel < 8) {
+   if (sel < 9) {
       st.sel_calls[sel]++;
       st.sel_ns[sel] += now_ns() - t0;
    }
@@ -423,6 +423,44 @@ static uint64_t queued, finished;       /* counts; queue[n % QUEUE_SIZE] */
 static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t qwork = PTHREAD_COND_INITIALIZER, qdone = PTHREAD_COND_INITIALIZER;
 
+static bool batch_supported = true;
+
+static void
+submit_batch_now(const uint64_t *pairs, unsigned count)
+{
+   if (count == 1 || !batch_supported) {
+      for (unsigned i = 0; i < count; i++)
+         submit_now(pairs[2 * i], pairs[2 * i + 1]);
+      return;
+   }
+   uint64_t out[2] = {0};
+   uint32_t nout = 2;
+   uint64_t t0 = now_ns();
+   kern_return_t kr = IOConnectCallMethod(conn, SEL_SUBMIT_BATCH, NULL, 0,
+                                          pairs, (size_t)count * 16, out, &nout, NULL, NULL);
+   uint64_t t1 = now_ns();
+   if (kr == (kern_return_t)0xe00002c7) { /* kIOReturnUnsupported: older kernel */
+      batch_supported = false;
+      for (unsigned i = 0; i < count; i++)
+         submit_now(pairs[2 * i], pairs[2 * i + 1]);
+      return;
+   }
+   st.sel_calls[SEL_SUBMIT_BATCH]++;
+   st.sel_ns[SEL_SUBMIT_BATCH] += t1 - t0;
+   submits += count;
+   st.submits += count;
+   st.gpu_us += out[1];
+   st.submit_ns += t1 - t0;
+   stats_tick(t1);
+   if (kr || out[0]) {
+      faults++;
+      if (faults <= 16 || debug > 0)
+         herodrm_log("BATCH #%llu (%u jobs): kr 0x%x status 0x%llx (%llu us)",
+                     (unsigned long long)submits, count, kr, (unsigned long long)out[0],
+                     (unsigned long long)out[1]);
+   }
+}
+
 static void *
 queue_worker(void *arg)
 {
@@ -432,11 +470,17 @@ queue_worker(void *arg)
    for (;;) {
       while (finished == queued)
          pthread_cond_wait(&qwork, &qlock);
-      uint64_t jc = queue[finished % QUEUE_SIZE].jc, js = queue[finished % QUEUE_SIZE].js;
+      uint64_t pairs[QUEUE_SIZE * 2];
+      unsigned n = 0;
+      while (finished + n < queued && n < QUEUE_SIZE) {
+         pairs[2 * n] = queue[(finished + n) % QUEUE_SIZE].jc;
+         pairs[2 * n + 1] = queue[(finished + n) % QUEUE_SIZE].js;
+         n++;
+      }
       pthread_mutex_unlock(&qlock);
-      submit_now(jc, js);
+      submit_batch_now(pairs, n);
       pthread_mutex_lock(&qlock);
-      finished++;
+      finished += n;
       pthread_cond_broadcast(&qdone);
    }
    return NULL;
@@ -487,8 +531,9 @@ submit(struct drm_panfrost_submit *s)
       pthread_t thread;
 
       asked = true;
-      async_on = a && *a == '1' && pthread_create(&thread, NULL, queue_worker, NULL) == 0;
-      herodrm_log("submits are %s", async_on ? "queued (HERO_ASYNC=1)" : "synchronous");
+      bool want_async = !(a && *a == '0');
+      async_on = want_async && pthread_create(&thread, NULL, queue_worker, NULL) == 0;
+      herodrm_log("submits are %s", async_on ? "queued + batched (HERO_ASYNC=1)" : "synchronous (HERO_ASYNC=0)");
    }
    if (!async_on)
       return submit_now(s->jc, js);

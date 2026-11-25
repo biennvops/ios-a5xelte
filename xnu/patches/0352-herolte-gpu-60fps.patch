@@ -1,0 +1,212 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 14c2fdd..36ff45a 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -40,6 +40,7 @@ uint64_t herolte_gpu_va_alloc(uint64_t bytes);
+ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
+ void herolte_gpu_unmap(uint64_t va, unsigned n);
+ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
++uint32_t herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us);
+ 
+ #define HG_PMU_PA       0x105c0000u
+ #define HG_PMU_G3D_CONF 0x4060u
+@@ -361,7 +362,7 @@ static uint32_t hg_affinity = 1;
+  * 0: before and after every job, as Linux's panfrost. 1 (default): only after, as a job begun finds it clean already.
+  * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
+  */
+-static uint32_t hg_flush_mode = 1;
++static uint32_t hg_flush_mode = 2;
+ /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
+ static uint64_t hg_job_va = HG_TEST_VA;
+ static vm_offset_t hg_job_cpu;
+@@ -902,19 +903,27 @@ hg_run(unsigned js, const char *what)
+ 	if (hg_run_quiet && hg_irq_ready()) {
+ 		hg_wait_irq(js, &jirq, &mirq, &girq);
+ 	} else {
++		static int spin_us = -1;
++		if (spin_us < 0) {
++			uint32_t sp = 500;
++			PE_parse_boot_argn("herogpu_spin_us", &sp, sizeof(sp));
++			spin_us = (int)(sp > 5000 ? 5000 : sp);
++		}
+ 		unsigned nap = (hg_run_nap && hg_sleep_us >= 10 && hg_sleep_us <= 5000) ? hg_sleep_us : 0;
+-		for (unsigned i = 0; i < 20000; i++) {
++		unsigned waited_us = 0;
++		while (waited_us < 200000) {
+ 			jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
+ 			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
+ 			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
+ 			if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
+ 				break;
+ 			}
+-			if (nap && i >= 4) {
++			if (nap && waited_us >= (unsigned)spin_us) {
+ 				hg_usleep(nap);
+-				i += nap / 10 - 1;      /* the same ~200 ms bound as the spinning loop */
++				waited_us += nap;
+ 			} else {
+-				delay(10);
++				delay(5);
++				waited_us += 5;
+ 			}
+ 		}
+ 	}
+@@ -1849,13 +1858,27 @@ hfb_give_up(const char *why)
+ }
+ 
+ /* The flip asked for last has been taken (bounded: two refreshes), and the IDMA read it without error. */
++static void
++hfb_wait_unlocked(void)
++{
++	vm_offset_t idma = __atomic_load_n(&hfb_idma, __ATOMIC_ACQUIRE);
++	if (__atomic_load_n(&hfb_state, __ATOMIC_ACQUIRE) != 1 || idma == 0) {
++		return;
++	}
++	unsigned us = 0;
++	while ((hg_rd(idma, 0x1c) & 1) && us < 38000) {
++		hg_usleep(200);
++		us += 200;
++	}
++}
++
+ static bool
+ hfb_settled(void)
+ {
+ 	unsigned us = 0;
+ 	while ((hg_rd(hfb_idma, 0x1c) & 1) && us < 40000) {
+-		delay(20);
+-		us += 20;
++		hg_usleep(100);
++		us += 100;
+ 	}
+ 	uint32_t irq = hg_rd(hfb_idma, 0x04);
+ 	if (irq & (1u << 19)) {
+@@ -2374,6 +2397,8 @@ herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n)
+ bool
+ herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ {
++	/* Wait for the previous VGR0/G1 flip to latch WITHOUT holding hg_mtx so backboardd can keep submitting. */
++	hfb_wait_unlocked();
+ 	lck_mtx_lock(hg_mtx);
+ 	bool ok = hgp_draw_locked(s, off, stride, w, h);
+ 	lck_mtx_unlock(hg_mtx);
+@@ -2573,6 +2598,45 @@ herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
+ 	return status;
+ }
+ 
++uint32_t
++herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us)
++{
++	if (pairs == NULL || count == 0 || count > 64) {
++		return ~0u;
++	}
++	lck_mtx_lock(hg_mtx);
++	uint32_t status = ~0u;
++	if (hg_up_state == 1) {
++		uint64_t start = mach_absolute_time();
++		hg_affinity = hg_rd(hg_gpu, SHADER_PRESENT_LO);
++		hg_job_cpu = 0;
++		hg_run_quiet = true;
++		hg_run_nap = true;
++		status = 0;
++		for (unsigned i = 0; i < count; i++) {
++			uint64_t jc = pairs[2 * i];
++			unsigned js = pairs[2 * i + 1] ? 1u : 0u;
++			if (jc == 0) {
++				continue;
++			}
++			hg_job_va = jc;
++			bool ok = hg_run(js, js ? "HEROGPU batch JS1" : "HEROGPU batch JS0");
++			if (!ok && status == 0) {
++				status = hg_last_js_status ? hg_last_js_status : ~0u;
++			}
++		}
++		hg_run_nap = false;
++		hg_run_quiet = false;
++		hg_job_va = HG_TEST_VA;
++		hg_affinity = 1;
++		if (us) {
++			*us = hg_us_since(start);
++		}
++	}
++	lck_mtx_unlock(hg_mtx);
++	return status;
++}
++
+ /* herogpu=7, step 2: all shader cores clear the whole panel, timed. */
+ static void
+ hg_all_cores_test(uint64_t hold)
+diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
+index 9bb2ee5..5595517 100644
+--- a/iokit/Kernel/arm/HeroGPU.cpp
++++ b/iokit/Kernel/arm/HeroGPU.cpp
+@@ -47,6 +47,7 @@ void herolte_gpu_va_report(void);         /* Note FE 0413 */
+ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
+ void herolte_gpu_unmap(uint64_t va, unsigned n);
+ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
++uint32_t herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us);
+ }
+ 
+ enum {
+@@ -58,6 +59,7 @@ enum {
+ 	kHeroGPULog      = 5,
+ 	kHeroGPUSurfaceBO = 6,
+ 	kHeroGPUSyncBO   = 7,
++	kHeroGPUSubmitBatch = 8,
+ };
+ 
+ #define HEROGPU_MAX_BOS         4096
+@@ -444,6 +446,20 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		IOLockLock(fLock);
+ 		outCount = 2;
+ 		break;
++	case kHeroGPUSubmitBatch: {
++		uint32_t n = args->structureInputSize / 16u;
++		if (args->structureInput == NULL || n == 0 || n > 64 || (args->structureInputSize & 15u) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint64_t pairs[128];
++		memcpy(pairs, args->structureInput, n * 16u);
++		IOLockUnlock(fLock);
++		out[0] = herolte_gpu_submit_batch(pairs, n, &out[1]);
++		IOLockLock(fLock);
++		outCount = 2;
++		break;
++	}
+ 	case kHeroGPUSurfaceBO: {
+ 		unsigned i = 0;
+ 		while (i < HEROGPU_MAX_BOS && herogpu_bo_used(&fBOs[i])) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 70d7ad1..8128cc6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1321,12 +1321,23 @@ AppleCLCD::gpuPresent(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32_
+ 		return false;
+ 	}
+ 	uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+-	uintptr_t start = s->kernelAddress() + (uintptr_t)off;
+-	uintptr_t end = start + (uintptr_t)(h - 1) * s->bytesPerRow + (uintptr_t)w * 4;
+-	for (uintptr_t p = start & ~(uintptr_t)63; p < end; p += 64) {
+-		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
++	/* With herogl=1, backboardd renders the display surface with the Mali GPU directly to DRAM;
++	 * skipping the redundant 4.1 MB CPU dc cvac saves ~1.2 ms/frame (sweetfb_gpuclean=1 restores it). */
++	static int gpuclean = -1;
++	if (gpuclean < 0) {
++		uint32_t gl = 0, force = 0;
++		PE_parse_boot_argn("herogl", &gl, sizeof(gl));
++		PE_parse_boot_argn("sweetfb_gpuclean", &force, sizeof(force));
++		gpuclean = (force != 0 || gl == 0) ? 1 : 0;
++	}
++	if (gpuclean) {
++		uintptr_t start = s->kernelAddress() + (uintptr_t)off;
++		uintptr_t end = start + (uintptr_t)(h - 1) * s->bytesPerRow + (uintptr_t)w * 4;
++		for (uintptr_t p = start & ~(uintptr_t)63; p < end; p += 64) {
++			__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+ 	if (!herolte_gpu_present_draw(slot, (uint32_t)off, s->bytesPerRow, (uint32_t)w, (uint32_t)h)) {
+ 		failures++;
+ 		return false;
