@@ -1503,6 +1503,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	EAGL_LEAVE(e, 0x30);
 }
 
+static int vblur_on;
 static void
 my_glClear(void *context, GLbitfield mask)
 {
