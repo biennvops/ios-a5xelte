@@ -646,3 +646,21 @@ Para el 8890 (kernel de Samsung `drivers/video/fbdev/exynos/decon_8890`, GPL; co
   - `xnu/patches/0347-herolte-decon-line-ticks.patch`: calibra `AppleCLCD::fLineTicks` en vivo desde `DECON +0x8c` tras 180 ticks (`DISP_PLL` ya activo) para `rearmVsync()` y `showFired()`.
   - `gpu/hakios-gl/src/eagl.c`: deshabilita `GL_SCISSOR_TEST` durante `glBlitFramebuffer` en `target_to_surface()` para no truncar el copiado de frames parciales al `IOSurface`; corrige `rows_sum()` con paso 1 para `height <= 256`; evita `glDraw*` cuando `e->program == 0` y `plain_draw_begin()` devuelve `false`; limpia `e->bound[]` en `my_glDeleteTextures()`.
   - `gpu/eagl/src/herosb.c` y `gpu/eagl/src/heroapp.c`: solo reemplaza `_UIStatusBarVisualProvider_Fallback`/`Nil` tras llamar al método original (evitando recursión cuando una subclase hereda el método), mantiene `keep_status_bar()` bajo `!gestures.off` y agrega `NSSetUncaughtExceptionHandler` en `herosb.c`.
+
+## 2026-11-25 — hero2lte: causa raíz y solución de los artefactos blancos+violetas en la barra de estado (DSC 38 MHz a 60 Hz)
+
+- **Bisección verificada en el dispositivo (`hero2lte`, panel `s6e3hf4_wqhd`, DSC=2):**
+  - Los artefactos persistían con `herogl=0` (software renderer nativo de Apple), `sweetfb_gpu=0` (copia CPU sin Mali/VGR0/FB2), `herovgr=0`, `sweetfb_tick=1`, `herosb=0` y `glblit=0`.
+  - Con `herofb_test=1` y `herofb_test=2` (píxeles estáticos idénticos entre cuadros en `y=0..44`) los artefactos desaparecían, y con `HEROLTE SBCHK`/`DSTCHK` no hubo picos blancos anómalos en memoria.
+  - **Causa raíz física (colisión de escritura vs lectura en la GRAM comprimida DSC del panel command-mode):** `0297` dejaba `DISP_PLL` en los `62,5 MHz` de S-Boot (para MIC 1:2 del S7 plano), escribiendo un cuadro DSC en `11,30 ms` frente al barrido interno del panel (~`16,3 ms`). Al adelantar el puntero de escritura al de lectura del decodificador DSC del panel, cada slice parcialmente sobrescrita se desincroniza (franjas rectas blancas/violetas). Comprobado variando `DISP_PLL` (`herodisp_mhz=N`):
+    - `62,5 MHz`: `reading 11304 us`, `decon irq 0x1001100` (FIFO underrun), artefacto sobre toda la barra de estado (~2 %).
+    - `48 MHz`: `reading 12969 us`, `decon irq 0x1001000`, el artefacto baja justo debajo de la barra de estado (~4 %).
+    - `40 MHz`: `reading 15564 us`, `decon irq 0x1001000`, el artefacto baja a ~15 % desde arriba.
+    - `26 MHz` (`herodisp=0`): `reading 23945 us`, 30 Hz, sin artefactos.
+    - **`38 MHz` (`M=304, P=13, S=4`, VCO `608 MHz`, `xnu-boot-38mhz.img` `113dc6eb…5bc6`, log `udp_38mhz.txt`):** `HEROLTE DECON: window 0 on VGR0: 13 frames in 200 ms, period 16582 us, reading 16383 us`, `FB2` + `VGR0` activos, `decon irq 0x1001000` (sin FIFO underrun), **60 Hz completos y confirmado sin artefactos en toda la pantalla**.
+- **Cambios (`xnu/patches/0351-herolte-dsc-disp-pll.patch`):**
+  - Reprograma `DISP_PLL` a `38 MHz` automáticamente cuando `DECON +0x230` indica DSC (`0x11`, `hero2lte`), dejando `62,5 MHz` en `herolte` (MIC) y permitiendo ajuste por `herodisp_mhz=N` (`38..63`).
+  - Acepta `G1 +0x18` (`IMG_SIZE`) además de `G1 +0x10` (`SRC_SIZE`) en `hfb_setup_locked()` porque `G1 +0x10` puede leer `0` durante el barrido activo.
+  - Desactiva por defecto `herosbchk` y `herodstchk` para eliminar el escaneo de píxeles por CPU en cada cuadro.
+- **Otros arreglos en `gpu/eagl/`:**
+  - `heroapp.c`: deshabilita `+[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:]` en `mediaserverd` (evita crash `sig 11 pc=0x0` cada 10 s cuando `cam.media=0`), y resuelve `UIGraphics*` / `NSSetUncaughtExceptionHandler` vía `dlsym` sin enlazar `UIKit`.
