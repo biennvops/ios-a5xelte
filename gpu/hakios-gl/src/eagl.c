@@ -3356,16 +3356,13 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 			glUniform1i(glGetUniformLocation(e->lookup, "table"), 1);
 		}
 		program = e->lookup;
-	} else if (function <= 4 || function == 16) {
+	} else {
 		if (e->plain == 0) {
 			e->plain = plain_program(plain_fragment, "as they are");
 			e->plain_matrix = glGetUniformLocation(e->plain, "vertex_matrix");
 			e->plain_textured = glGetUniformLocation(e->plain, "textured");
 		}
 		program = e->plain;
-	} else {
-		census_draw(e, function, CENSUS_NOT_DRAWN);
-		return false;
 	}
 	census_draw(e, function, rows == 1 ? CENSUS_TABLE : CENSUS_PLAIN);
 	glUseProgram(program);
