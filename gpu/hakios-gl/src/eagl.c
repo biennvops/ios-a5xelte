@@ -1515,10 +1515,7 @@ my_glClear(void *context, GLbitfield mask)
 		}
 	}
 	struct image *target_img = e->colour != 0 ? image_of(e, e->colour) : NULL;
-	bool may_vblur = vblur_on && e->colour != 0 && (target_img == NULL || !target_img->target) &&
-	    (e->colour >= IMAGE_INDEX_MAX || e->tex_w[e->colour] == 0 ||
-	    (e->tex_w[e->colour] >= 300 && e->tex_h[e->colour] >= 400));
-	if (may_vblur) {
+	if (vblur_on && e->colour != 0 && (target_img == NULL || !target_img->target)) {
 		/* what is about to be cleared may be what the next draw reads: see reads_what_it_writes() */
 		e->unclear = mask;
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
