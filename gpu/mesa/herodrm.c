@@ -51,7 +51,7 @@ kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO, SEL_SUBMIT_BATCH };
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO, SEL_SUBMIT_BATCH, SEL_ENQUEUE, SEL_WAIT_SEQ };
 
 #define MAX_BOS 4096
 
@@ -74,9 +74,9 @@ static uint64_t submits, faults;
  * kernel zeroes, cleans and maps every new buffer). */
 static struct {
    uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
-   uint64_t sel_calls[9], sel_ns[9];    /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
+   uint64_t sel_calls[11], sel_ns[11];  /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
 } st;
-static const char *const sel_names[9] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo", "batch" };
+static const char *const sel_names[11] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo", "batch", "enq", "wait" };
 
 EXPORT void herodrm_log(const char *fmt, ...);
 
@@ -104,7 +104,7 @@ stats_tick(uint64_t t)
                (unsigned long long)st.frees);
    char by[512];
    int used = 0;
-   for (int i = 0; i < 9 && used < (int)sizeof(by) - 48; i++) {
+   for (int i = 0; i < 11 && used < (int)sizeof(by) - 48; i++) {
       if (st.sel_calls[i] && i != 5)
          used += snprintf(by + used, sizeof(by) - used, " %s %llu/%.1fms", sel_names[i],
                           (unsigned long long)st.sel_calls[i], st.sel_ns[i] / 1e6);
@@ -121,7 +121,7 @@ call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nou
    uint32_t n = nout;
    uint64_t t0 = now_ns();
    kern_return_t kr = IOConnectCallMethod(conn, sel, in, nin, NULL, 0, out, &n, NULL, NULL);
-   if (sel < 9) {
+   if (sel < 11) {
       st.sel_calls[sel]++;
       st.sel_ns[sel] += now_ns() - t0;
    }
@@ -256,20 +256,21 @@ heap_cap(void)
    return (mb ? mb : 32) << 20;
 }
 
-static bool async_on;
+static bool async_on, kfifo_on;
+static uint64_t kfifo_done, kfifo_gpu_us;
 static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
 static void queue_drain(void);
 static bool bo_busy(uint32_t handle);
 static void bo_wait(uint32_t handle);
 
 /*
- * Userspace pool for recently-freed small non-surface BOs (<= 256 KB, up to 8 MB total).
+ * Userspace pool for recently-freed small non-surface BOs (<= 2 MB, up to 32 MB total).
  * Avoids repeated kernel page allocation, zeroing, CPU cache cleaning and Mali MMU flushes
  * when Control Center / CoreAnimation churns transient batch and texture BOs.
  */
-#define BO_POOL_MAX       64
+#define BO_POOL_MAX       128
 #define BO_POOL_ITEM_MAX  (2u * 1024u * 1024u)
-#define BO_POOL_BYTES_MAX (24u * 1024u * 1024u)
+#define BO_POOL_BYTES_MAX (32u * 1024u * 1024u)
 static uint32_t bo_pool[BO_POOL_MAX];
 static unsigned bo_pool_count;
 static uint64_t bo_pool_bytes;
@@ -569,8 +570,25 @@ queue_worker(void *arg)
 }
 
 static void
+kfifo_wait(uint64_t seq, bool nonblock)
+{
+   uint64_t in[2] = { seq, nonblock ? 1 : 0 }, out[2] = {0};
+   if (conn && call(SEL_WAIT_SEQ, in, 2, out, 2) == 0) {
+      __atomic_store_n(&kfifo_done, out[0], __ATOMIC_RELEASE);
+      if (out[1] >= kfifo_gpu_us) {
+         st.gpu_us += out[1] - kfifo_gpu_us;
+         kfifo_gpu_us = out[1];
+      }
+   }
+}
+
+static void
 queue_drain(void)
 {
+   if (kfifo_on) {
+      kfifo_wait(0, false);
+      return;
+   }
    if (!async_on)
       return;
    pthread_mutex_lock(&qlock);
@@ -583,7 +601,16 @@ queue_drain(void)
 static bool
 bo_busy(uint32_t handle)
 {
-   if (!async_on || !handle || handle > MAX_BOS)
+   if (!handle || handle > MAX_BOS)
+      return false;
+   if (kfifo_on) {
+      uint64_t need = bo_last_job[handle];
+      if (need == 0 || need <= __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
+         return false;
+      kfifo_wait(0, true);
+      return need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE);
+   }
+   if (!async_on)
       return false;
    pthread_mutex_lock(&qlock);
    bool busy = finished < bo_last_job[handle];
@@ -594,7 +621,15 @@ bo_busy(uint32_t handle)
 static void
 bo_wait(uint32_t handle)
 {
-   if (!async_on || !handle || handle > MAX_BOS)
+   if (!handle || handle > MAX_BOS)
+      return;
+   if (kfifo_on) {
+      uint64_t need = bo_last_job[handle];
+      if (need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
+         kfifo_wait(need, false);
+      return;
+   }
+   if (!async_on)
       return;
    pthread_mutex_lock(&qlock);
    while (finished < bo_last_job[handle])
@@ -614,8 +649,43 @@ submit(struct drm_panfrost_submit *s)
 
       asked = true;
       bool want_async = !(a && *a == '0');
-      async_on = want_async && pthread_create(&thread, NULL, queue_worker, NULL) == 0;
-      herodrm_log("submits are %s", async_on ? "queued + batched (HERO_ASYNC=1)" : "synchronous (HERO_ASYNC=0)");
+      if (want_async) {
+         uint64_t in[2] = { 0, 1 }, out[2] = {0};
+         if (call(SEL_WAIT_SEQ, in, 2, out, 2) == 0) {
+            kfifo_on = true;
+            __atomic_store_n(&kfifo_done, out[0], __ATOMIC_RELEASE);
+            kfifo_gpu_us = out[1];
+         }
+      }
+      if (!kfifo_on)
+         async_on = want_async && pthread_create(&thread, NULL, queue_worker, NULL) == 0;
+      herodrm_log("submits are %s",
+                  kfifo_on ? "kernel FIFO (0357)" :
+                  async_on ? "queued + batched (HERO_ASYNC=1)" : "synchronous (HERO_ASYNC=0)");
+   }
+   if (kfifo_on) {
+      __asm__ volatile ("dsb sy" ::: "memory");
+      uint64_t in[2] = { s->jc, js }, out[3] = {0};
+      uint64_t t0 = now_ns();
+      uint32_t kr = call(SEL_ENQUEUE, in, 2, out, 3);
+      uint64_t t1 = now_ns();
+      if (kr || out[0] == 0)
+         return fail(EIO);
+      uint64_t seq = out[0];
+      __atomic_store_n(&kfifo_done, out[1], __ATOMIC_RELEASE);
+      if (out[2] >= kfifo_gpu_us) {
+         st.gpu_us += out[2] - kfifo_gpu_us;
+         kfifo_gpu_us = out[2];
+      }
+      submits++;
+      st.submits++;
+      st.submit_ns += t1 - t0;
+      stats_tick(t1);
+      const uint32_t *handles = (const uint32_t *)(uintptr_t)s->bo_handles;
+      for (uint32_t i = 0; i < s->bo_handle_count; i++)
+         if (handles[i] && handles[i] <= MAX_BOS)
+            bo_last_job[handles[i]] = seq;
+      return 0;
    }
    if (!async_on)
       return submit_now(s->jc, js);
@@ -887,8 +957,9 @@ EXPORT int
 drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
                unsigned flags, uint32_t *first_signaled)
 {
-   (void)fd; (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
-   queue_drain();
+   (void)fd; (void)handles; (void)num_handles; (void)flags;
+   if (!(kfifo_on && timeout_nsec == 0))
+      queue_drain();
    if (first_signaled)
       *first_signaled = 0;
    return 0;
