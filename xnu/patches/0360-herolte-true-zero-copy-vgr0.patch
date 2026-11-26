@@ -1,0 +1,243 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 0c65019..2256b31 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1861,7 +1861,8 @@ static int hfb_triple = -1;             /* boot-arg herofb3=0 disables VGR0 trip
+ static int hfb_triple_full = -1;        /* boot-arg herofb3_full=1 enables 0x94000000 3rd full-panel buffer */
+ static uint64_t hfb_flips;
+ static int hvg_state;                   /* (0338) 0 window 0 on G1, 1 on VGR0, -1 never again */
+-static uint32_t hvg_w, hvg_h;
++static uint32_t hvg_w, hvg_h, hvg_stride;
++static int herozc_on = -1;
+ static void hvg_leave(const char *why);
+ 
+ static void
+@@ -1967,9 +1968,13 @@ hfb_setup_locked(void)
+ 	}
+ 	hg_wr(hfb_idma, 0x04, 1u << 19);        /* a stale read error is not ours */
+ 	if (hfb_triple < 0) {
+-		uint32_t t3 = 1, t3f = 0;
++		uint32_t t3 = 1, t3f = 0, zc = 0;
+ 		PE_parse_boot_argn("herofb3", &t3, sizeof(t3));
+ 		PE_parse_boot_argn("herofb3_full", &t3f, sizeof(t3f));
++		PE_parse_boot_argn("herozc", &zc, sizeof(zc));
++		if (zc) {
++			t3f = 0; /* 0x94000000..0x97000000 belongs to the zero-copy IOSurface pool */
++		}
+ 		hfb_triple = t3 ? 1 : 0;
+ 		if (t3f) {
+ 			hg_zero(hgp_scr + HGP_FB3_L3_OFF, 8 * 0x1000);
+@@ -2160,7 +2165,7 @@ hvg_window_update(void)
+ 
+ /* The frame just drawn at pa (w x h, HVG_STRIDE_PX a row) goes on screen through VGR0. */
+ static void
+-hvg_enter(uint64_t pa, uint32_t w, uint32_t h)
++hvg_enter(uint64_t pa, uint32_t w, uint32_t h, uint32_t stride_px)
+ {
+ 	uint32_t wc = hg_rd(hvg_decon, 0x130);
+ 	if (!(wc & 1u) || ((wc >> 12) & 7u) != 0) {
+@@ -2171,12 +2176,13 @@ hvg_enter(uint64_t pa, uint32_t w, uint32_t h)
+ 	if (hg_rd(hvg_mmu, 0x0) != 0) {
+ 		hg_wr(hvg_mmu, 0x0, 0);                                 /* SysMMU bypass: VGR0 reads physical addresses */
+ 	}
+-	hg_vgr0_program(hvg_vgr, (uint32_t)pa, w, h, hvg_stride_px(w), HG_PANEL_W, HG_PANEL_H);
++	hg_vgr0_program(hvg_vgr, (uint32_t)pa, w, h, stride_px, HG_PANEL_W, HG_PANEL_H);
+ 	hg_wr(hvg_vgr, 0x04, hg_rd(hvg_vgr, 0x04) | (1u << 19));       /* no stale read error */
+ 	hg_wr(hvg_decon, 0x130, (wc & ~(7u << 12)) | (5u << 12));
+ 	bool updated = hvg_window_update();
+ 	hvg_w = w;
+ 	hvg_h = h;
++	hvg_stride = stride_px;
+ 	hfb_idma = hvg_vgr;
+ 	hvg_state = 1;
+ 	if (++hvg_entries <= 3 || hvg_entries % 100 == 0 || !updated) {
+@@ -2275,7 +2281,7 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	if (hfb_state == 0) {
+ 		hfb_setup_locked();
+ 	}
+-	if (hvg_state == 1 && (w != hvg_w || h != hvg_h)) {
++	if (hvg_state == 1 && (w != hvg_w || h != hvg_h || hvg_stride_px(w) != hvg_stride)) {
+ 		hvg_leave("the frame size changed");
+ 	}
+ 	/* (0338) 1:1 into a buffer VGR0 scales, or scaled by the Mali into the panel's buffer */
+@@ -2456,7 +2462,7 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	if (ok && small && hvg_state == 0) {
+ 		/* the first frame for VGR0: into the buffer G1 does not show, then window 0 to VGR0 reading it */
+ 		if (hfb_state == 1) {
+-			hvg_enter(target_pa, w, h);
++			hvg_enter(target_pa, w, h, vgr_sp);
+ 		}
+ 		if (hvg_state != 1) {
+ 			hvg_left_at = mach_absolute_time();
+@@ -4628,6 +4634,88 @@ bool notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h);
+ bool
+ notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
+ {
++	if (herozc_on < 0) {
++		uint32_t v = 0;
++		PE_parse_boot_argn("herozc", &v, sizeof(v));
++		herozc_on = v ? 1 : 0;
++	}
++	if (herozc_on == 1) {
++		static uint64_t hzc_flips;
++		if (pa == 0 || pa + (uint64_t)bpr * h > 0x100000000ull || (bpr & 3u) != 0 || bpr / 4u < w) {
++			return false;
++		}
++		uint32_t sp = bpr / 4u;
++		/* Lock-free steady-state VGR0 zero-copy flip (~5 us, zero Mali work, zero hg_mtx contention). */
++		if (__atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1 && hvg_vgr != 0 &&
++		    w == hvg_w && h == hvg_h && sp == hvg_stride && !(hg_rd(hvg_vgr, 0x04) & (1u << 19))) {
++			if (hg_rd(hvg_vgr, 0xb74) != (uint32_t)pa) {
++				hg_wr(hvg_vgr, 0x74, (uint32_t)pa);
++				hg_wr(hvg_vgr, 0x1c, 1);
++				if (++hzc_flips <= 5 || hzc_flips % 2000 == 0) {
++					printf("HEROLTE ZC: flip %llu to %#llx (%ux%u stride %u) decon %#x vgr %#x\n",
++					    hzc_flips, pa, w, h, sp, hvg_decon ? hg_rd(hvg_decon, 0x48) : 0, hg_rd(hvg_vgr, 0x04));
++				}
++			}
++			return true;
++		}
++		/* Native 1440x2560 lock-free zero-copy flip on G1. */
++		if (w == HG_PANEL_W && h == HG_PANEL_H && bpr == HG_FB_STRIDE &&
++		    __atomic_load_n(&hfb_state, __ATOMIC_ACQUIRE) == 1 &&
++		    __atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 0 && hfb_g1 != 0 &&
++		    !(hg_rd(hfb_g1, 0x04) & (1u << 19))) {
++			if (hg_rd(hfb_g1, 0xb74) != (uint32_t)pa) {
++				hg_wr(hfb_g1, 0x74, (uint32_t)pa);
++				hg_wr(hfb_g1, 0x1c, 1);
++				if (++hzc_flips <= 5 || hzc_flips % 2000 == 0) {
++					printf("HEROLTE ZC: G1 flip %llu to %#llx (%ux%u) idma %#x\n",
++					    hzc_flips, pa, w, h, hg_rd(hfb_g1, 0x04));
++				}
++			}
++			return true;
++		}
++		lck_mtx_lock(hg_mtx);
++		if (hgp_state == 0) {
++			hgp_state = hgp_setup() ? 1 : -1;
++		}
++		if (hfb_state == 0 && hgp_state == 1) {
++			hfb_setup_locked();
++		}
++		if (hvg_state == 1 && hvg_vgr != 0 && (hg_rd(hvg_vgr, 0x04) & (1u << 19))) {
++			hg_wr(hvg_vgr, 0x04, 1u << 19);
++			hvg_leave("VGR0 ZC read error");
++			hvg_state = -1;
++		}
++		if (hvg_state == 1 && (w != hvg_w || h != hvg_h || sp != hvg_stride)) {
++			hvg_leave("ZC frame size changed");
++		}
++		bool zok = false;
++		if (w == HG_PANEL_W && h == HG_PANEL_H && bpr == HG_FB_STRIDE) {
++			if (hvg_state == 1) {
++				hvg_leave("native 1:1 ZC");
++			}
++			if (hfb_state == 1 && hfb_g1 != 0) {
++				hg_wr(hfb_g1, 0x74, (uint32_t)pa);
++				hg_wr(hfb_g1, 0x1c, 1);
++				hzc_flips++;
++				printf("HEROLTE ZC: active on G1 (%ux%u, pa %#llx)\n", w, h, pa);
++				zok = true;
++			}
++		} else if (hvg_state == 0 && hvg_wanted(w, h)) {
++			hvg_enter(pa, w, h, sp);
++			if (hvg_state == 1) {
++				hzc_flips++;
++				printf("HEROLTE ZC: active on VGR0 (%ux%u stride %u, pa %#llx)\n", w, h, sp, pa);
++				zok = true;
++			}
++		} else if (hvg_state == 1 && hvg_vgr != 0 && w == hvg_w && h == hvg_h && sp == hvg_stride) {
++			hg_wr(hvg_vgr, 0x74, (uint32_t)pa);
++			hg_wr(hvg_vgr, 0x1c, 1);
++			hzc_flips++;
++			zok = true;
++		}
++		lck_mtx_unlock(hg_mtx);
++		return zok;
++	}
+ 	if (zc_state < 0 || pa == 0 || pa + (uint64_t)bpr * h > 0x100000000ull) {
+ 		return false;
+ 	}
+@@ -4746,7 +4834,8 @@ bool notefe_zc_active(void);
+ bool
+ notefe_zc_active(void)
+ {
+-	return zc_on_window;
++	return zc_on_window || (herozc_on == 1 && (__atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1 ||
++	    __atomic_load_n(&hfb_state, __ATOMIC_ACQUIRE) == 1));
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d00c125..28140f6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -90,18 +90,23 @@ static uint32_t notefe_zc_slot_id[3];
+ static bool notefe_zc_slot_pending[3];
+ static int notefe_zc_pool_on = -1;
+ 
++static bool herozc_pool_16m;
++
+ extern "C" uint64_t
+ notefe_zc_pool_take(uint32_t w, uint32_t h, uint32_t fmt, uint32_t planes, uint32_t size)
+ {
+ 	if (notefe_zc_pool_on < 0) {
+-		uint32_t on = 0;        /* (0431) off by default: the panel froze (boots 23-28) */
++		uint32_t on = 0, hzc = 0;
+ 		PE_parse_boot_argn("notefe_zc", &on, sizeof(on));
+-		notefe_zc_pool_on = on ? 1 : 0;
++		PE_parse_boot_argn("herozc", &hzc, sizeof(hzc));
++		herozc_pool_16m = hzc != 0;
++		notefe_zc_pool_on = (on || hzc) ? 1 : 0;
+ 	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
++	uint32_t max_sz = herozc_pool_16m ? 0x1000000u : 0x400000u;
+ 	if (!notefe_zc_pool_on || notefe_zc_pool_w == 0 || w != notefe_zc_pool_w || h != notefe_zc_pool_h ||
+-	    fmt != 0x42475241u /* BGRA */ || planes != 0 || size > 0x400000 || strcmp(name, "backboardd") != 0) {
++	    fmt != 0x42475241u /* BGRA */ || planes != 0 || size > max_sz || strcmp(name, "backboardd") != 0) {
+ 		return 0;
+ 	}
+ 	for (unsigned k = 0; k < 3; k++) {
+@@ -116,21 +121,26 @@ notefe_zc_pool_take(uint32_t w, uint32_t h, uint32_t fmt, uint32_t planes, uint3
+ 		}
+ 		notefe_zc_slot_pending[k] = true;
+ 		notefe_zc_slot_id[k] = 0;
+-		uint64_t pa = 0xa0400000ULL + (uint64_t)k * 0x400000;
+-		IOLog("NOTEFE ZC: backboardd's %ux%u surface in display memory at %#llx\n", w, h, pa);
++		uint64_t pa = herozc_pool_16m ? (0x94000000ULL + (uint64_t)k * 0x1000000ULL) :
++		    (0xa0400000ULL + (uint64_t)k * 0x400000ULL);
++		IOLog("HEROLTE ZC: backboardd's %ux%u surface (%u B) in display memory at %#llx\n", w, h, size, pa);
+ 		return pa;
+ 	}
+-	IOLog("NOTEFE ZC: backboardd's %ux%u surface: no display slot free\n", w, h);
++	IOLog("HEROLTE ZC: backboardd's %ux%u surface: no display slot free\n", w, h);
+ 	return 0;
+ }
+ 
+ extern "C" void
+ notefe_zc_pool_bind(uint64_t pa, uint32_t id)
+ {
+-	unsigned k = (unsigned)((pa - 0xa0400000ULL) / 0x400000);
+-	if (pa >= 0xa0400000ULL && k < 3) {
+-		notefe_zc_slot_id[k] = id;
+-		notefe_zc_slot_pending[k] = false;
++	uint64_t base = herozc_pool_16m ? 0x94000000ULL : 0xa0400000ULL;
++	uint64_t step = herozc_pool_16m ? 0x1000000ULL : 0x400000ULL;
++	if (pa >= base) {
++		unsigned k = (unsigned)((pa - base) / step);
++		if (k < 3 && pa == base + (uint64_t)k * step) {
++			notefe_zc_slot_id[k] = id;
++			notefe_zc_slot_pending[k] = false;
++		}
+ 	}
+ }
+ extern "C" volatile uint64_t herolte_screen_off_at;    /* bsd/dev/herolte_gpu.c (0330) */
+@@ -1258,6 +1268,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			addr64_t pa = s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone);
+ 			if (pa != 0 && seg >= (IOByteCount)s->bytesPerRow * (IOByteCount)h &&
+ 			    notefe_zc_flip(pa, s->bytesPerRow, (uint32_t)w, (uint32_t)h)) {
++				copied += (uint64_t)fWidth * fHeight * 4;
+ 				s->release();
+ 				continue;
+ 			}
