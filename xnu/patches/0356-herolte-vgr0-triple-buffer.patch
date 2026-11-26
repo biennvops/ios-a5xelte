@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 5b98105..84e0105 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1828,12 +1828,15 @@ hgp_map_locked(uint32_t id, const uint64_t *pages, unsigned n)
+  */
+ #define HG_FB2_PA       0x91000000ull
+ #define HG_PANEL2_VA    0x06000000ull
++#define HG_FB3_PA       0x91500000ull   /* 3rd VGR0 buffer (4 MiB), inside HG_FB2_PA's 14 MiB mapping */
++#define HG_PANEL3_VA    0x06500000ull
+ #define HGP_FB2_L3_OFF  0x120000u       /* 8 L3 tables in the scratch block, after the user L2 */
+ #define HG_IDMA_G1_PA   0x13952000u
+ #define HG_DECON_F_PA   0x13960000u
+ static vm_offset_t hfb_idma;            /* the channel window 0 reads: G1, or VGR0 (0338) */
+ static vm_offset_t hfb_g1;
+-static int hfb_state;                   /* 0 not tried, 1 two buffers, -1 one */
++static int hfb_state;                   /* 0 not tried, 1 two/three buffers, -1 one */
++static int hfb_triple = -1;             /* boot-arg herofb3=0 disables VGR0 triple buffering */
+ static uint64_t hfb_flips;
+ static int hvg_state;                   /* (0338) 0 window 0 on G1, 1 on VGR0, -1 never again */
+ static void hvg_leave(const char *why);
+@@ -1861,6 +1864,10 @@ hfb_give_up(const char *why)
+ static void
+ hfb_wait_unlocked(void)
+ {
++	if (__atomic_load_n(&hfb_triple, __ATOMIC_ACQUIRE) == 1 &&
++	    __atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1) {
++		return;
++	}
+ 	vm_offset_t idma = __atomic_load_n(&hfb_idma, __ATOMIC_ACQUIRE);
+ 	if (__atomic_load_n(&hfb_state, __ATOMIC_ACQUIRE) != 1 || idma == 0) {
+ 		return;
+@@ -1934,8 +1941,15 @@ hfb_setup_locked(void)
+ 		return;
+ 	}
+ 	hg_wr(hfb_idma, 0x04, 1u << 19);        /* a stale read error is not ours */
++	if (hfb_triple < 0) {
++		uint32_t t3 = 1;
++		PE_parse_boot_argn("herofb3", &t3, sizeof(t3));
++		hfb_triple = t3 ? 1 : 0;
++	}
+ 	hfb_state = 1;
+-	printf("HEROLTE FB2: two buffers, %#llx and %#llx (GPU VA %#llx), on IDMA G1\n", HG_FB_PA, HG_FB2_PA, HG_PANEL2_VA);
++	printf("HEROLTE FB2: %s buffers, %#llx / %#llx%s (GPU VA %#llx), on IDMA G1\n",
++	    hfb_triple ? "three (VGR0)" : "two", HG_FB_PA, HG_FB2_PA,
++	    hfb_triple ? " / 0x91500000" : "", HG_PANEL2_VA);
+ 	/*
+ 	 * Note FE (0422), zero-copy step 1, read only: how S-Boot left the scaling channel VG0 (0x13953000; same clock,
+ 	 * 850, and power domain, DISP0 at 0x105c4080, as G1, which is in use) next to G1, and the DECON's windows
+@@ -2252,9 +2266,31 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 		hg_wr32(scr, S_TILER_JOB + i * 4, 0);
+ 		hg_wr32(scr, S_FRAG_JOB + i * 4, 0);
+ 	}
+-	/* Into the buffer that is not shown (herofb2), once the last flip has been taken. */
++	/*
++	 * Triple-buffered mailbox on VGR0 (herofb3=1): pick the 4 MiB buffer that is neither being
++	 * scanned out (0xb74 shadow) nor queued for the next TE (0x74 while 0x1c bit 0 is set),
++	 * eliminating the ~10-16 ms VSYNC wait on fWorkLoop. Falls back to 2-buffer hfb_settled() on G1.
++	 */
+ 	uint64_t target_pa = HG_FB_PA, target_va = HG_PANEL_VA;
+-	if (hfb_state == 1 && hfb_settled() && hg_rd(hfb_idma, 0xb74) == (uint32_t)HG_FB_PA) {
++	if (hfb_state == 1 && small && hvg_state == 1 && hfb_triple == 1) {
++		uint32_t irq = hg_rd(hfb_idma, 0x04);
++		if (irq & (1u << 19)) {
++			hg_wr(hfb_idma, 0x04, 1u << 19);
++			hfb_give_up("IDMA read error");
++		} else {
++			static const uint64_t fb3_pa[3] = { HG_FB_PA, HG_FB2_PA, HG_FB3_PA };
++			static const uint64_t fb3_va[3] = { HG_PANEL_VA, HG_PANEL2_VA, HG_PANEL3_VA };
++			uint32_t cur = hg_rd(hfb_idma, 0xb74);
++			uint32_t pend = (hg_rd(hfb_idma, 0x1c) & 1u) ? hg_rd(hfb_idma, 0x74) : 0u;
++			for (unsigned k = 0; k < 3; k++) {
++				if ((uint32_t)fb3_pa[k] != cur && (uint32_t)fb3_pa[k] != pend) {
++					target_pa = fb3_pa[k];
++					target_va = fb3_va[k];
++					break;
++				}
++			}
++		}
++	} else if (hfb_state == 1 && hfb_settled() && hg_rd(hfb_idma, 0xb74) == (uint32_t)HG_FB_PA) {
+ 		target_pa = HG_FB2_PA;
+ 		target_va = HG_PANEL2_VA;
+ 	}
