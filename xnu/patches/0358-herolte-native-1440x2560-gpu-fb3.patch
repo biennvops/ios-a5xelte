@@ -1,0 +1,154 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 1fd038c..3f662ca 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1532,9 +1532,9 @@ hg_draw(uint64_t hold, bool tex)
+  * and runs tiler then fragment. Run only with herogpu<=2 (no test jobs).
+  */
+ #define HGP_SLOTS       4u
+-#define HGP_SLOT_TABLES 4u
++#define HGP_SLOT_TABLES 8u              /* 16 MiB per slot: fits native 1440x2560 BGRA surfaces (14.06 MiB) */
+ #define HGP_SLOT_PAGES  (HGP_SLOT_TABLES * 512u)
+-#define HGP_L3_OFF      0x100000u       /* slot L3 tables, in the scratch block */
++#define HGP_L3_OFF      0x140000u       /* 32 slot L3 tables (128 KiB), in the upper scratch block */
+ #define HGP_VA_BASE     0x10000000ull
+ #define HGP_VA_END      0x40000000ull   /* the one L2 table covers 1 GiB */
+ 
+@@ -1846,13 +1846,17 @@ hgp_map_locked(uint32_t id, const uint64_t *pages, unsigned n)
+ #define HG_PANEL2_VA    0x06000000ull
+ #define HG_FB3_PA       0x91500000ull   /* 3rd VGR0 buffer (4 MiB), inside HG_FB2_PA's 14 MiB mapping */
+ #define HG_PANEL3_VA    0x06500000ull
++#define HG_FB3_FULL_PA  0x94000000ull   /* 3rd full-panel buffer (16 MiB) for native 1440x2560 G1 triple buffering */
++#define HG_PANEL3_FULL_VA 0x0c000000ull
+ #define HGP_FB2_L3_OFF  0x120000u       /* 8 L3 tables in the scratch block, after the user L2 */
++#define HGP_FB3_L3_OFF  0x130000u       /* 8 L3 tables for HG_FB3_FULL_PA */
+ #define HG_IDMA_G1_PA   0x13952000u
+ #define HG_DECON_F_PA   0x13960000u
+ static vm_offset_t hfb_idma;            /* the channel window 0 reads: G1, or VGR0 (0338) */
+ static vm_offset_t hfb_g1;
+ static int hfb_state;                   /* 0 not tried, 1 two/three buffers, -1 one */
+ static int hfb_triple = -1;             /* boot-arg herofb3=0 disables VGR0 triple buffering */
++static int hfb_triple_full = -1;        /* boot-arg herofb3_full=1 enables 0x94000000 3rd full-panel buffer */
+ static uint64_t hfb_flips;
+ static int hvg_state;                   /* (0338) 0 window 0 on G1, 1 on VGR0, -1 never again */
+ static void hvg_leave(const char *why);
+@@ -1880,8 +1884,9 @@ hfb_give_up(const char *why)
+ static void
+ hfb_wait_unlocked(void)
+ {
+-	if (__atomic_load_n(&hfb_triple, __ATOMIC_ACQUIRE) == 1 &&
+-	    __atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1) {
++	if (__atomic_load_n(&hfb_triple_full, __ATOMIC_ACQUIRE) == 1 ||
++	    (__atomic_load_n(&hfb_triple, __ATOMIC_ACQUIRE) == 1 &&
++	    __atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1)) {
+ 		return;
+ 	}
+ 	vm_offset_t idma = __atomic_load_n(&hfb_idma, __ATOMIC_ACQUIRE);
+@@ -1958,14 +1963,35 @@ hfb_setup_locked(void)
+ 	}
+ 	hg_wr(hfb_idma, 0x04, 1u << 19);        /* a stale read error is not ours */
+ 	if (hfb_triple < 0) {
+-		uint32_t t3 = 1;
++		uint32_t t3 = 1, t3f = 0;
+ 		PE_parse_boot_argn("herofb3", &t3, sizeof(t3));
++		PE_parse_boot_argn("herofb3_full", &t3f, sizeof(t3f));
+ 		hfb_triple = t3 ? 1 : 0;
++		if (t3f) {
++			hg_zero(hgp_scr + HGP_FB3_L3_OFF, 8 * 0x1000);
++			for (unsigned t = 0; t * 512 < pages; t++) {
++				uint32_t table = HGP_FB3_L3_OFF + t * 0x1000;
++				volatile uint64_t *l3 = (volatile uint64_t *)(hgp_scr + table);
++				for (unsigned i = 0; i < 512 && t * 512 + i < pages; i++) {
++					l3[i] = (HG_FB3_FULL_PA + (uint64_t)(t * 512 + i) * 0x1000) | 0x2c1;
++				}
++				l2t[((HG_PANEL3_FULL_VA >> 21) & 0x1ff) + t] = (HG_SCR_PA + table) | 3;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			if (hgp_mmu_flush(HG_PANEL3_FULL_VA, 24)) {
++				__atomic_store_n(&hfb_triple_full, 1, __ATOMIC_RELEASE);
++			} else {
++				__atomic_store_n(&hfb_triple_full, 0, __ATOMIC_RELEASE);
++			}
++		} else {
++			__atomic_store_n(&hfb_triple_full, 0, __ATOMIC_RELEASE);
++		}
+ 	}
+ 	hfb_state = 1;
+ 	printf("HEROLTE FB2: %s buffers, %#llx / %#llx%s (GPU VA %#llx), on IDMA G1\n",
+-	    hfb_triple ? "three (VGR0)" : "two", HG_FB_PA, HG_FB2_PA,
+-	    hfb_triple ? " / 0x91500000" : "", HG_PANEL2_VA);
++	    hfb_triple_full == 1 ? "three (full)" : hfb_triple ? "three (VGR0)" : "two",
++	    HG_FB_PA, HG_FB2_PA,
++	    hfb_triple_full == 1 ? " / 0x94000000" : hfb_triple ? " / 0x91500000" : "", HG_PANEL2_VA);
+ 	/*
+ 	 * Note FE (0422), zero-copy step 1, read only: how S-Boot left the scaling channel VG0 (0x13953000; same clock,
+ 	 * 850, and power domain, DISP0 at 0x105c4080, as G1, which is in use) next to G1, and the DECON's windows
+@@ -2288,14 +2314,14 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	 * eliminating the ~10-16 ms VSYNC wait on fWorkLoop. Falls back to 2-buffer hfb_settled() on G1.
+ 	 */
+ 	uint64_t target_pa = HG_FB_PA, target_va = HG_PANEL_VA;
+-	if (hfb_state == 1 && small && hvg_state == 1 && hfb_triple == 1) {
++	if (hfb_state == 1 && ((small && hvg_state == 1 && hfb_triple == 1) || (!small && hfb_triple_full == 1))) {
+ 		uint32_t irq = hg_rd(hfb_idma, 0x04);
+ 		if (irq & (1u << 19)) {
+ 			hg_wr(hfb_idma, 0x04, 1u << 19);
+ 			hfb_give_up("IDMA read error");
+ 		} else {
+-			static const uint64_t fb3_pa[3] = { HG_FB_PA, HG_FB2_PA, HG_FB3_PA };
+-			static const uint64_t fb3_va[3] = { HG_PANEL_VA, HG_PANEL2_VA, HG_PANEL3_VA };
++			uint64_t fb3_pa[3] = { HG_FB_PA, HG_FB2_PA, small ? HG_FB3_PA : HG_FB3_FULL_PA };
++			uint64_t fb3_va[3] = { HG_PANEL_VA, HG_PANEL2_VA, small ? HG_PANEL3_VA : HG_PANEL3_FULL_VA };
+ 			uint32_t cur = hg_rd(hfb_idma, 0xb74);
+ 			uint32_t pend = (hg_rd(hfb_idma, 0x1c) & 1u) ? hg_rd(hfb_idma, 0x74) : 0u;
+ 			for (unsigned k = 0; k < 3; k++) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 397edcf..567fc19 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -70,7 +70,7 @@ extern "C" bool sweet_fb_last_surface(uint64_t *pages, unsigned max_pages, unsig
+ extern "C" int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+ extern "C" int herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
+ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
+-#define SWEET_FB_GPU_MAX_PAGES 2048     /* one 8 MiB GPU slot */
++#define SWEET_FB_GPU_MAX_PAGES 4096     /* one 16 MiB GPU slot (fits 1440x2560) */
+ /* Two panel buffers (herofb2): the Mali draws into the one not shown; the CPU writes only the first, shown first. */
+ extern "C" bool herolte_fb_two_buffers(void);
+ extern "C" void herolte_fb_primary(void);
+@@ -438,8 +438,9 @@ AppleCLCD::start(IOService *provider)
+ 			fLogicalW = 750;
+ 			fLogicalH = 1334;
+ 		}
+-		/* sweetfb_gpu=1: full-screen frames go through the Mali instead
+-		 * (herolte_gpu.c), bilinear; scaledCopy() stays the fallback. */
++	}
++	{
++		/* sweetfb_gpu=1: full-screen frames go through the Mali (scaled or native 1:1 into FB2/FB3). */
+ 		int gpu = 0;
+ 		PE_parse_boot_argn("sweetfb_gpu", &gpu, sizeof(gpu));
+ 		fGpu = gpu != 0;
+@@ -459,12 +460,12 @@ AppleCLCD::start(IOService *provider)
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* Scaled, what CoreAnimation draws into the default surface must not land on the panel unscaled (a small copy of
+ 	 * the screen in its corner): the surface has its own memory, free in the first bank, and is presented like any other. */
+-	if (fScaled) {
+-		/* (0425) rows 256-byte aligned, as CoreAnimation's own display surfaces (3072 for 750): the scaler
+-		 * keeps one row length for both */
++	if (fScaled || fGpu) {
++		/* (0425) rows 256-byte aligned (5760 = 256*22.5 -> 5888 for 1440 = 14.375 MiB, fits 16 MiB at 0xa0000000). */
+ 		notefe_zc_pool_w = fLogicalW;
+ 		notefe_zc_pool_h = fLogicalH;
+-		fSurface = sweet_surface_create_physical(0xa0000000ULL, fLogicalW, fLogicalH, (fLogicalW * 4 + 255) & ~255u,
++		uint32_t sbpr = fScaled ? ((fLogicalW * 4 + 255) & ~255u) : fRowBytes;
++		fSurface = sweet_surface_create_physical(0xa0000000ULL, fLogicalW, fLogicalH, sbpr,
+ 		    SWEET_FB_FORMAT_BGRA);
+ 		SweetSurface *panel = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 		fPixels = panel != NULL ? panel->kernelAddress() : 0;
+@@ -1126,7 +1127,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || (s == fSurface && !fScaled)) {
++		if (s == NULL || (s == fSurface && !fScaled && !fGpu)) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
