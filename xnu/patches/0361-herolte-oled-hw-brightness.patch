@@ -72,7 +72,7 @@ index 2256b31..be0297b 100644
 +		uint32_t want = notefe_bright_level;
 +		if (want == applied) {
 +			uint64_t deadline;
-+			clock_interval_to_deadline(250, kMillisecondScale, &deadline);
++			clock_interval_to_deadline(250, NSEC_PER_MSEC, &deadline);
 +			(void)assert_wait_deadline((event_t)&hg_bright_ev, THREAD_UNINT, deadline);
 +			thread_block(THREAD_CONTINUE_NULL);
 +			continue;
