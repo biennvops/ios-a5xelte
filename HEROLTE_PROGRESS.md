@@ -678,3 +678,6 @@ Para el 8890 (kernel de Samsung `drivers/video/fbdev/exynos/decon_8890`, GPL; co
 - **Medido en vivo (`0356`, `750x1334`, log `/tmp/live_0356_wifi.txt`):**
   - `A5XELTE FB: frames=218 elapsed_ms=4973 fps=43.8 avg_copy_us=951 max_copy_us=1157 swaps=218 overwritten=0` (antes de `0356`: `avg_copy_us=9678 max=17771 overwritten=74`).
   - Cuadros en `backboardd`: Home Screen `5,8–11,5 ms` (85–118 draws), Control Center `16,35 ms` (183 draws); Mali ocupada ~21 %; confirmado visualmente casi 60 fps en Home Screen y cero artefactos.
+- **Cola FIFO en kernel + `HakiosWaitsForGPU` (`0357`, `44bf4d1`, log `/tmp/live_0357.txt`):**
+  - `herolte_gpu_enqueue()` + `hg_worker_thread` (anillo de 256 trabajos en kernel, `hg_q_done` actualizado tras cada trabajo individual) y `HakiosWaitsForGPU=true` en `AppleCLCD` (la espera ocurre en `fWorkLoop`, no en `glFinish()` de `backboardd`).
+  - `create` bajó de `106 BOs / 74 ms` a **`9 BOs / 11,4 ms`** (6,5× menos overhead de BOs), `submit calls` bajó de `1656 ms` a **`301 ms`** (5,5× menos), promedio global de cuadro bajó de `11,8 ms` a **`7,48 ms`**, `134–137 draws` en **`12,97–13,14 ms`**, `avg_copy_us=837 us`, `overwritten=0`, SoC estable en `77 °C` (máx. `79 °C`, sin caer a `728 MHz`).
