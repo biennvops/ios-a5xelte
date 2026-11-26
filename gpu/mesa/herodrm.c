@@ -60,7 +60,6 @@ struct hbo {
    uint64_t va, size;
    uint64_t cpu;
    bool in_use;
-   bool pooled;
    bool evictable;
    bool purged;
 };
@@ -268,18 +267,6 @@ static void queue_drain(void);
 static bool bo_busy(uint32_t handle);
 static void bo_wait(uint32_t handle);
 
-/*
- * Userspace pool for recently-freed small non-surface BOs (<= 2 MB, up to 32 MB total).
- * Avoids repeated kernel page allocation, zeroing, CPU cache cleaning and Mali MMU flushes
- * when Control Center / CoreAnimation churns transient batch and texture BOs.
- */
-#define BO_POOL_MAX       128
-#define BO_POOL_ITEM_MAX  (2u * 1024u * 1024u)
-#define BO_POOL_BYTES_MAX (32u * 1024u * 1024u)
-static uint32_t bo_pool[BO_POOL_MAX];
-static unsigned bo_pool_count;
-static uint64_t bo_pool_bytes;
-
 static uint32_t
 alloc_uhandle(void)
 {
@@ -298,21 +285,6 @@ is_prime_handle(uint32_t h)
    return false;
 }
 
-static void
-bo_pool_flush(void)
-{
-   while (bo_pool_count > 0) {
-      uint32_t h = bo_pool[--bo_pool_count];
-      bo_pool_bytes -= bos[h].size;
-      bo_wait(h);
-      bo_last_job[h] = 0;
-      uint64_t in = bos[h].khandle;
-      call(SEL_FREE, &in, 1, NULL, 0);
-      st.frees++;
-      memset(&bos[h], 0, sizeof(bos[h]));
-   }
-}
-
 /* Reclaim kernel pages + GPU VA from Mesa's DONTNEED-cached BOs until evictable_bytes <= target_bytes. */
 static unsigned
 purge_evictable(uint64_t target_bytes, bool large_only)
@@ -320,7 +292,7 @@ purge_evictable(uint64_t target_bytes, bool large_only)
    unsigned purged_n = 0;
    for (uint32_t h = 1; h <= MAX_BOS && evictable_bytes > target_bytes; h++) {
       struct hbo *bo = &bos[h];
-      if (!bo->in_use || bo->pooled || !bo->evictable || bo->purged || !bo->khandle)
+      if (!bo->in_use || !bo->evictable || bo->purged || !bo->khandle)
          continue;
       if (large_only && bo->size < (1024u * 1024u))
          continue;
@@ -342,57 +314,13 @@ purge_evictable(uint64_t target_bytes, bool large_only)
    return purged_n;
 }
 
-static uint32_t
-bo_pool_take(uint64_t page_size)
-{
-   for (unsigned i = 0; i < bo_pool_count; i++) {
-      uint32_t h = bo_pool[i];
-      if (bos[h].size == page_size && !bo_busy(h)) {
-         bo_pool[i] = bo_pool[--bo_pool_count];
-         bo_pool_bytes -= bos[h].size;
-         bos[h].pooled = false;
-         if (!bos[h].cpu) {
-            uint64_t in = bos[h].khandle, out = 0;
-            if (call(SEL_MAP, &in, 1, &out, 1) == 0)
-               bos[h].cpu = out;
-         }
-         if (bos[h].cpu) {
-            memset((void *)(uintptr_t)bos[h].cpu, 0, (size_t)bos[h].size);
-            __asm__ volatile ("dsb sy" ::: "memory");
-            return h;
-         }
-         /* Could not map to zero: fall back to kernel free. */
-         uint64_t in = bos[h].khandle;
-         call(SEL_FREE, &in, 1, NULL, 0);
-         st.frees++;
-         memset(&bos[h], 0, sizeof(bos[h]));
-         return 0;
-      }
-   }
-   return 0;
-}
-
 static int
 create_bo(struct drm_panfrost_create_bo *req)
 {
    uint64_t size = req->size;
    if (req->flags & PANFROST_BO_HEAP && size > heap_cap())
       size = heap_cap();
-   uint64_t aligned = (size + 0xfffull) & ~0xfffull;
-   if (!(req->flags & PANFROST_BO_HEAP) && aligned > 0 && aligned <= BO_POOL_ITEM_MAX) {
-      uint32_t reused = bo_pool_take(aligned);
-      if (reused) {
-         req->handle = reused;
-         req->offset = bos[reused].va;
-         req->size = (uint32_t)bos[reused].size;
-         return 0;
-      }
-   }
    uint32_t u = alloc_uhandle();
-   if (!u) {
-      bo_pool_flush();
-      u = alloc_uhandle();
-   }
    if (!u) {
       herodrm_log("CREATE_BO: userspace BO handle table full");
       return fail(ENOMEM);
@@ -401,16 +329,14 @@ create_bo(struct drm_panfrost_create_bo *req)
    uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
    if (kr || out[0] == 0 || out[0] > MAX_BOS) {
-      if (bo_pool_count > 0)
-         bo_pool_flush();
       unsigned p = purge_evictable(0, false);
       if (p == 0 && evictable_bytes > 0) {
          queue_drain();
          p = purge_evictable(0, false);
       }
-      if (p > 0 || bo_pool_count == 0) {
+      if (p > 0) {
          kr = call(SEL_CREATE, &in, 1, out, 3);
-         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS && p > 0)
+         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS)
             herodrm_log("CREATE_BO %llu B recovered after purging %u cached BOs", (unsigned long long)size, p);
       }
    }
@@ -438,14 +364,14 @@ create_bo(struct drm_panfrost_create_bo *req)
 static struct hbo *
 lookup(uint32_t handle)
 {
-   return handle && handle <= MAX_BOS && bos[handle].in_use && !bos[handle].pooled && !bos[handle].purged && bos[handle].va
+   return handle && handle <= MAX_BOS && bos[handle].in_use && !bos[handle].purged && bos[handle].va
           ? &bos[handle] : NULL;
 }
 
 static int
 free_bo(uint32_t handle)
 {
-   if (!handle || handle > MAX_BOS || !bos[handle].in_use || bos[handle].pooled)
+   if (!handle || handle > MAX_BOS || !bos[handle].in_use)
       return fail(EINVAL);
    if (bos[handle].purged) {
       memset(&bos[handle], 0, sizeof(bos[handle]));
@@ -455,20 +381,11 @@ free_bo(uint32_t handle)
       evictable_bytes -= bos[handle].size;
       bos[handle].evictable = false;
    }
-   bool is_prime = false;
    for (int i = 0; i < MAX_PRIME; i++)
       if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
          close(primes[i].fd);
          primes[i].handle = 0;
-         is_prime = true;
       }
-   if (!is_prime && bos[handle].size <= BO_POOL_ITEM_MAX &&
-       bo_pool_count < BO_POOL_MAX && bo_pool_bytes + bos[handle].size <= BO_POOL_BYTES_MAX) {
-      bos[handle].pooled = true;
-      bo_pool[bo_pool_count++] = handle;
-      bo_pool_bytes += bos[handle].size;
-      return 0;
-   }
    bo_wait(handle);
    bo_last_job[handle] = 0;
    uint64_t in = bos[handle].khandle;
@@ -854,7 +771,7 @@ drmIoctl(int fd, unsigned long request, void *arg)
       break;
    case DRM_IOCTL_PANFROST_MADVISE: {
       struct drm_panfrost_madvise *m = arg;
-      if (!m->handle || m->handle > MAX_BOS || !bos[m->handle].in_use || bos[m->handle].pooled) {
+      if (!m->handle || m->handle > MAX_BOS || !bos[m->handle].in_use) {
          r = fail(EINVAL);
          break;
       }
@@ -964,8 +881,6 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
       uint64_t in = surface_id, out[9] = {0};
       uint32_t kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       if (kr != 0 || !out[0] || out[0] > MAX_BOS) {
-         if (bo_pool_count > 0)
-            bo_pool_flush();
          if (purge_evictable(0, false) > 0)
             kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       }
@@ -975,10 +890,6 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
             if (!primes[i].handle)
                slot = i;
          uint32_t u = alloc_uhandle();
-         if (!u && bo_pool_count > 0) {
-            bo_pool_flush();
-            u = alloc_uhandle();
-         }
          int fd = (slot >= 0 && u != 0) ? open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
          if (fd >= 0) {
             bos[u] = (struct hbo){ .khandle = (uint32_t)out[0], .va = out[1], .size = out[2], .in_use = true };
