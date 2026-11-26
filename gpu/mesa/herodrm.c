@@ -958,8 +958,17 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_
                unsigned flags, uint32_t *first_signaled)
 {
    (void)fd; (void)handles; (void)num_handles; (void)flags;
-   if (!(kfifo_on && timeout_nsec == 0))
-      queue_drain();
+   if (kfifo_on) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      int64_t now_mono = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+      if (timeout_nsec <= now_mono) {
+         if (first_signaled)
+            *first_signaled = 0;
+         return 0;
+      }
+   }
+   queue_drain();
    if (first_signaled)
       *first_signaled = 0;
    return 0;

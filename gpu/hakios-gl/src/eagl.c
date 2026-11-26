@@ -374,7 +374,7 @@ static int blit_targets = 1;
  * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn).
  */
 static int wait_for_frames = 1;
-static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
+static int sync_frames = 0;             /* boot-arg glsync=1: extra Freedreno glFenceSync flush (Panfrost glFlush submits directly) */
 static int sync_display_targets = 0;    /* boot-arg glsyncbo=1: dc civac full-screen targets every frame (GPU present does not need it) */
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
@@ -4709,7 +4709,7 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
-		sync_frames = strstr(arguments, "glsync=0") == NULL;
+		sync_frames = strstr(arguments, "glsync=1") != NULL;
 		sync_display_targets = strstr(arguments, "glsyncbo=1") != NULL;
 		check_errors = strstr(arguments, "glerrors=1") != NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
