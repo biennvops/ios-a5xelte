@@ -748,15 +748,6 @@ surface_changed(struct eagl *e, struct image *image)
 	if (used > row) {
 		used = row;
 	}
-	if (image->height <= 256) {
-		uint64_t full_sum = rows_sum(base, row, used, image->height, 0, 1);
-		if (image->sums_known && full_sum == image->sum) {
-			return false;
-		}
-		image->sum = full_sum;
-		image->sums_known = true;
-		return true;
-	}
 	unsigned phase = e->frames % 8;
 	if (image->sums_known && rows_sum(base, row, used, image->height, phase, 8) == image->sums[phase]) {
 		return false;

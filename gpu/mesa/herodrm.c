@@ -268,8 +268,8 @@ static void bo_wait(uint32_t handle);
  * when Control Center / CoreAnimation churns transient batch and texture BOs.
  */
 #define BO_POOL_MAX       64
-#define BO_POOL_ITEM_MAX  (256u * 1024u)
-#define BO_POOL_BYTES_MAX (8u * 1024u * 1024u)
+#define BO_POOL_ITEM_MAX  (2u * 1024u * 1024u)
+#define BO_POOL_BYTES_MAX (24u * 1024u * 1024u)
 static uint32_t bo_pool[BO_POOL_MAX];
 static unsigned bo_pool_count;
 static uint64_t bo_pool_bytes;
