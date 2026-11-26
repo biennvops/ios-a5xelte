@@ -3193,8 +3193,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 	 * keeps came out black, and with it the zoom that opens an application the first time.
 	 */
 	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0) || reads_what_it_writes(e) ||
-	    (e->colour != 0 && e->colour == e->bound[0]) ||
-	    function == FUNCTION_VIBRANT_MATRIX || function == 61 || function == 66) {
+	    (e->colour != 0 && e->colour == e->bound[0])) {
 		census_draw(e, function, CENSUS_NOT_DRAWN);
 		return false;
 	}
