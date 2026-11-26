@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
-index 3f662ca..afc0a42 100644
+index 3f662ca..0c65019 100644
 --- a/bsd/dev/herolte_gpu.c
 +++ b/bsd/dev/herolte_gpu.c
 @@ -43,6 +43,8 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
@@ -11,7 +11,15 @@ index 3f662ca..afc0a42 100644
  
  #define HG_PMU_PA       0x105c0000u
  #define HG_PMU_G3D_CONF 0x4060u
-@@ -1886,7 +1888,8 @@ hfb_wait_unlocked(void)
+@@ -1859,6 +1861,7 @@ static int hfb_triple = -1;             /* boot-arg herofb3=0 disables VGR0 trip
+ static int hfb_triple_full = -1;        /* boot-arg herofb3_full=1 enables 0x94000000 3rd full-panel buffer */
+ static uint64_t hfb_flips;
+ static int hvg_state;                   /* (0338) 0 window 0 on G1, 1 on VGR0, -1 never again */
++static uint32_t hvg_w, hvg_h;
+ static void hvg_leave(const char *why);
+ 
+ static void
+@@ -1886,7 +1889,8 @@ hfb_wait_unlocked(void)
  {
  	if (__atomic_load_n(&hfb_triple_full, __ATOMIC_ACQUIRE) == 1 ||
  	    (__atomic_load_n(&hfb_triple, __ATOMIC_ACQUIRE) == 1 &&
@@ -21,7 +29,11 @@ index 3f662ca..afc0a42 100644
  		return;
  	}
  	vm_offset_t idma = __atomic_load_n(&hfb_idma, __ATOMIC_ACQUIRE);
-@@ -2081,10 +2084,17 @@ static uint32_t hvg_w, hvg_h;
+@@ -2077,14 +2081,20 @@ herolte_fb_two_buffers(void)
+ static void hg_vgr0_program(vm_offset_t vg, uint32_t pa, uint32_t sw, uint32_t sh, uint32_t stride_px, uint32_t dw, uint32_t dh);
+ static uint32_t hg_decon_measure(vm_offset_t decon, const char *when);
+ static vm_offset_t hvg_decon, hvg_vgr, hvg_mmu;
+-static uint32_t hvg_w, hvg_h;
  static uint64_t hvg_left_at, hvg_entries;
  
  /* Can window 0 go to VGR0 for a w x h frame now? */
