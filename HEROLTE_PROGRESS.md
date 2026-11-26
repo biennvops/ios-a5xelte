@@ -664,3 +664,17 @@ Para el 8890 (kernel de Samsung `drivers/video/fbdev/exynos/decon_8890`, GPL; co
   - Desactiva por defecto `herosbchk` y `herodstchk` para eliminar el escaneo de píxeles por CPU en cada cuadro.
 - **Otros arreglos en `gpu/eagl/`:**
   - `heroapp.c`: deshabilita `+[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:]` en `mediaserverd` (evita crash `sig 11 pc=0x0` cada 10 s cuando `cam.media=0`), y resuelve `UIGraphics*` / `NSSetUncaughtExceptionHandler` vía `dlsym` sin enlazar `UIKit`.
+
+## 2026-11-26 — hero2lte: 60 Hz sin artefactos (`M=303`), triple buffer VGR0 y optimización GPU/CPU (`0352`–`0356`)
+
+- **Display 60 Hz sin artefactos (`0354`–`0355`):**
+  - `M=301` (`37,625 MHz`, `16546 us`) y `M=302` (`37,750 MHz`, `16492 us`) perdían un TE de cada dos (30 Hz).
+  - **`M=303` (`37,875 MHz`, `reading 16437 us`, `period 16582 us`, `decon irq 0x1001000`)**: 60 Hz reales con `VGR0` activo y confirmado en el teléfono sin artefactos en toda la pantalla.
+- **Rendimiento GPU/CPU hacia 60 fps (`0352`–`0356`, `herodrm.c`, `eagl.c`):**
+  - `0352`: espera VSYNC fuera de `hg_mtx`, fast-poll corto (`2 us` hasta `500 us`), `kHeroGPUSubmitBatch` (hasta 64 trabajos/syscall), omisión del `dc cvac` redundante de 4,1 MB en `gpuPresent()` con `herogl=1`.
+  - `herodrm.c` + `eagl.c`: envíos asíncronos en lote (`HERO_ASYNC=1` por defecto), pool de BOs transitorios en espacio de usuario (hasta 2 MiB c/u, 24 MiB total), búsqueda O(1) de texturas/FBO/dimensiones, `check_errors=0` por defecto y omisión del `dc civac` por cuadro en targets de pantalla.
+  - `0354`–`0355`: decodificación TMU de 9 bits (backport de `9197` de upstream) + escalón térmico suave (`2288 -> 1976 MHz` a `74 °C`, `728 MHz` a `86 °C`); corrección de `EP_INT` en `sweet_usb.c` y suscripción UDP (`sub`/`sub_all`/`twrp`) sobre Wi-Fi (`en0`) además de USB (`ue0`).
+  - `0356`: **triple buffer mailbox en `VGR0`** (`0xe2a00000` / `0x91000000` / `0x91500000`, `herofb3=1`), eliminando la espera VSYNC de `10–17 ms` sobre `fWorkLoop`.
+- **Medido en vivo (`0356`, `750x1334`, log `/tmp/live_0356_wifi.txt`):**
+  - `A5XELTE FB: frames=218 elapsed_ms=4973 fps=43.8 avg_copy_us=951 max_copy_us=1157 swaps=218 overwritten=0` (antes de `0356`: `avg_copy_us=9678 max=17771 overwritten=74`).
+  - Cuadros en `backboardd`: Home Screen `5,8–11,5 ms` (85–118 draws), Control Center `16,35 ms` (183 draws); Mali ocupada ~21 %; confirmado visualmente casi 60 fps en Home Screen y cero artefactos.
