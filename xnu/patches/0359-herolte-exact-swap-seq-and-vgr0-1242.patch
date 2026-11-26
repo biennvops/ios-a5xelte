@@ -1,0 +1,225 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 3f662ca..afc0a42 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -43,6 +43,8 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ uint32_t herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us);
+ uint64_t herolte_gpu_enqueue(unsigned js, uint64_t jc, uint64_t *done_out, uint64_t *gpu_us_out);
+ uint64_t herolte_gpu_wait_seq(uint64_t seq, bool nonblock, uint64_t *gpu_us_out);
++uint64_t herolte_gpu_tail_seq(void);
++void herolte_gpu_wait_present(uint64_t seq);
+ 
+ #define HG_PMU_PA       0x105c0000u
+ #define HG_PMU_G3D_CONF 0x4060u
+@@ -1886,7 +1888,8 @@ hfb_wait_unlocked(void)
+ {
+ 	if (__atomic_load_n(&hfb_triple_full, __ATOMIC_ACQUIRE) == 1 ||
+ 	    (__atomic_load_n(&hfb_triple, __ATOMIC_ACQUIRE) == 1 &&
+-	    __atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1)) {
++	    __atomic_load_n(&hvg_state, __ATOMIC_ACQUIRE) == 1 &&
++	    __atomic_load_n(&hvg_w, __ATOMIC_ACQUIRE) <= 768u)) {
+ 		return;
+ 	}
+ 	vm_offset_t idma = __atomic_load_n(&hfb_idma, __ATOMIC_ACQUIRE);
+@@ -2081,10 +2084,17 @@ static uint32_t hvg_w, hvg_h;
+ static uint64_t hvg_left_at, hvg_entries;
+ 
+ /* Can window 0 go to VGR0 for a w x h frame now? */
++static inline uint32_t
++hvg_stride_px(uint32_t w)
++{
++	return (w + 63u) & ~63u;
++}
++
+ static bool
+ hvg_wanted(uint32_t w, uint32_t h)
+ {
+-	if (hvg_state != 0 || hfb_state != 1 || w > HVG_STRIDE_PX || h > HG_PANEL_H || w < 64 || h < 64) {
++	if (hvg_state != 0 || hfb_state != 1 || w >= HG_PANEL_W || h >= HG_PANEL_H ||
++	    w * 2u < HG_PANEL_W || h * 2u < HG_PANEL_H || w < 64 || h < 64) {
+ 		return false;
+ 	}
+ 	if (hvg_left_at && mach_absolute_time() - hvg_left_at < 26000000u) {      /* 1 s at 26 MHz */
+@@ -2161,7 +2171,7 @@ hvg_enter(uint64_t pa, uint32_t w, uint32_t h)
+ 	if (hg_rd(hvg_mmu, 0x0) != 0) {
+ 		hg_wr(hvg_mmu, 0x0, 0);                                 /* SysMMU bypass: VGR0 reads physical addresses */
+ 	}
+-	hg_vgr0_program(hvg_vgr, (uint32_t)pa, w, h, HVG_STRIDE_PX, HG_PANEL_W, HG_PANEL_H);
++	hg_vgr0_program(hvg_vgr, (uint32_t)pa, w, h, hvg_stride_px(w), HG_PANEL_W, HG_PANEL_H);
+ 	hg_wr(hvg_vgr, 0x04, hg_rd(hvg_vgr, 0x04) | (1u << 19));       /* no stale read error */
+ 	hg_wr(hvg_decon, 0x130, (wc & ~(7u << 12)) | (5u << 12));
+ 	bool updated = hvg_window_update();
+@@ -2270,13 +2280,15 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	}
+ 	/* (0338) 1:1 into a buffer VGR0 scales, or scaled by the Mali into the panel's buffer */
+ 	bool small = hvg_state == 1 || hvg_wanted(w, h);
++	uint32_t vgr_sp = hvg_stride_px(w);
++	bool small_fits_fb3 = (uint64_t)vgr_sp * (uint64_t)h * 4ull <= 0x500000ull;
+ 	uint32_t rw = small ? w : HG_PANEL_W, rh = small ? h : HG_PANEL_H;
+ 	hg_wr32(scr, S_VIEWPORT + 8, hgp_f32(rw));
+ 	hg_wr32(scr, S_VIEWPORT + 12, hgp_f32(rh));
+ 	hg_wr32(scr, S_VIEWPORT + 28, ((rh - 1) << 16) | (rw - 1));
+ 	hg_wr32(scr, S_FBD + 32, ((rh - 1) << 16) | (rw - 1));
+ 	hg_wr32(scr, S_FBD + 40, ((rh - 1) << 16) | (rw - 1));
+-	hg_wr32(scr, S_FBD + 128 + 40, small ? HVG_STRIDE_PX * 4 : HG_FB_STRIDE);
++	hg_wr32(scr, S_FBD + 128 + 40, small ? vgr_sp * 4 : HG_FB_STRIDE);
+ 	hg_wr32(scr, S_FRAG_JOB + 36, (((rh + 15) / 16 - 1) << 16) | ((rw + 15) / 16 - 1));
+ 	uint32_t x0 = 0, x1 = HG_PANEL_W, y0 = 0, y1 = HG_PANEL_H;
+ 	if (small) {
+@@ -2314,14 +2326,16 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 	 * eliminating the ~10-16 ms VSYNC wait on fWorkLoop. Falls back to 2-buffer hfb_settled() on G1.
+ 	 */
+ 	uint64_t target_pa = HG_FB_PA, target_va = HG_PANEL_VA;
+-	if (hfb_state == 1 && ((small && hvg_state == 1 && hfb_triple == 1) || (!small && hfb_triple_full == 1))) {
++	bool use_triple = (small && hvg_state == 1) ? (small_fits_fb3 ? (hfb_triple == 1) : (hfb_triple_full == 1)) : (!small && hfb_triple_full == 1);
++	if (hfb_state == 1 && use_triple) {
+ 		uint32_t irq = hg_rd(hfb_idma, 0x04);
+ 		if (irq & (1u << 19)) {
+ 			hg_wr(hfb_idma, 0x04, 1u << 19);
+ 			hfb_give_up("IDMA read error");
+ 		} else {
+-			uint64_t fb3_pa[3] = { HG_FB_PA, HG_FB2_PA, small ? HG_FB3_PA : HG_FB3_FULL_PA };
+-			uint64_t fb3_va[3] = { HG_PANEL_VA, HG_PANEL2_VA, small ? HG_PANEL3_VA : HG_PANEL3_FULL_VA };
++			bool use_small3 = small && small_fits_fb3;
++			uint64_t fb3_pa[3] = { HG_FB_PA, HG_FB2_PA, use_small3 ? HG_FB3_PA : HG_FB3_FULL_PA };
++			uint64_t fb3_va[3] = { HG_PANEL_VA, HG_PANEL2_VA, use_small3 ? HG_PANEL3_VA : HG_PANEL3_FULL_VA };
+ 			uint32_t cur = hg_rd(hfb_idma, 0xb74);
+ 			uint32_t pend = (hg_rd(hfb_idma, 0x1c) & 1u) ? hg_rd(hfb_idma, 0x74) : 0u;
+ 			for (unsigned k = 0; k < 3; k++) {
+@@ -2389,7 +2403,7 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 		vm_offset_t dst = (target_pa == HG_FB2_PA) ? t_fb2 : t_fb1;
+ 		if (ok && dst && dst_chk && !fb_test) {
+ 			static uint32_t prev_dmax, d_jumps;
+-			uint32_t rw_px = small ? HVG_STRIDE_PX : HG_PANEL_W;
++			uint32_t rw_px = small ? vgr_sp : HG_PANEL_W;
+ 			uint32_t rlim = small ? 80u : 150u;
+ 			uint32_t xlim = small ? w : HG_PANEL_W;
+ 			uint32_t dmax = 0, dy = 0;
+@@ -2413,7 +2427,7 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 			prev_dmax = dmax;
+ 		}
+ 		if (ok && dst && (fb_test == 1 || fb_test == 2)) {
+-			uint32_t rw_px = small ? HVG_STRIDE_PX : HG_PANEL_W;
++			uint32_t rw_px = small ? vgr_sp : HG_PANEL_W;
+ 			uint32_t rh_px = small ? h : HG_PANEL_H;
+ 			uint32_t xlim = small ? w : HG_PANEL_W;
+ 			uint32_t c_bar = 0xff282828u;
+@@ -2475,10 +2489,6 @@ herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n)
+ bool
+ herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ {
+-	/* Drain all client GPU jobs queued up to this swap (e.g. glBlitFramebuffer) on fWorkLoop. */
+-	if (__atomic_load_n(&hg_q_started, __ATOMIC_ACQUIRE)) {
+-		(void)herolte_gpu_wait_seq(0, false, NULL);
+-	}
+ 	/* Wait for the previous VGR0/G1 flip to latch WITHOUT holding hg_mtx so backboardd can keep submitting. */
+ 	hfb_wait_unlocked();
+ 	lck_mtx_lock(hg_mtx);
+@@ -2780,7 +2790,8 @@ herolte_gpu_enqueue(unsigned js, uint64_t jc, uint64_t *done_out, uint64_t *gpu_
+ 	}
+ 	hg_q[hg_q_tail % HG_Q_SIZE].jc = jc;
+ 	hg_q[hg_q_tail % HG_Q_SIZE].js = (uint8_t)js;
+-	uint64_t seq = ++hg_q_tail;
++	uint64_t seq = hg_q_tail + 1;
++	__atomic_store_n(&hg_q_tail, seq, __ATOMIC_RELEASE);
+ 	uint64_t done = hg_q_done;
+ 	uint64_t tus = hg_q_gpu_us;
+ 	thread_wakeup((event_t)&hg_q_work_ev);
+@@ -2813,6 +2824,20 @@ herolte_gpu_wait_seq(uint64_t seq, bool nonblock, uint64_t *gpu_us_out)
+ 	return done;
+ }
+ 
++uint64_t
++herolte_gpu_tail_seq(void)
++{
++	return __atomic_load_n(&hg_q_tail, __ATOMIC_ACQUIRE);
++}
++
++void
++herolte_gpu_wait_present(uint64_t seq)
++{
++	if (seq != 0 && __atomic_load_n(&hg_q_started, __ATOMIC_ACQUIRE)) {
++		(void)herolte_gpu_wait_seq(seq, false, NULL);
++	}
++}
++
+ /* herogpu=7, step 2: all shader cores clear the whole panel, timed. */
+ static void
+ hg_all_cores_test(uint64_t hold)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 567fc19..d00c125 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -70,6 +70,8 @@ extern "C" bool sweet_fb_last_surface(uint64_t *pages, unsigned max_pages, unsig
+ extern "C" int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+ extern "C" int herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
+ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
++extern "C" uint64_t herolte_gpu_tail_seq(void);
++extern "C" void herolte_gpu_wait_present(uint64_t seq);
+ #define SWEET_FB_GPU_MAX_PAGES 4096     /* one 16 MiB GPU slot (fits 1440x2560) */
+ /* Two panel buffers (herofb2): the Mali draws into the one not shown; the CPU writes only the first, shown first. */
+ extern "C" bool herolte_fb_two_buffers(void);
+@@ -218,6 +220,7 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	uint64_t      fSwapSeq, fPendingSeq, fShownSeq;     /* (0425) swaps given, the pending one, the last one shown */
++	uint64_t      fPendingGpuSeq;                       /* (0359) kernel GPU FIFO tail at SwapEnd */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+@@ -696,10 +699,11 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	show = show && mach_absolute_time() >= sweet_fb_hold_until;
+ #endif
+-	uint64_t seq = 0;
++	uint64_t seq = 0, gpu_seq = 0;
+ 	if (show) {
+ 		memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 		seq = fb->fPendingSeq;
++		gpu_seq = fb->fPendingGpuSeq;
+ 		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -710,6 +714,9 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (show) {
+ 		uint64_t before = mach_absolute_time();
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		herolte_gpu_wait_present(gpu_seq);
++#endif
+ 		uint64_t bytes = fb->present(rec);
+ 		if (trace) {
+ 			IOLog("NOTEFE ZC: show %llu: presented (zero copy %d)\n", zc_traced, notefe_zc_active());
+@@ -798,10 +805,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ #endif
+ 	uint8_t *rec = NULL;
++	uint64_t v_gpu_seq = 0;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			v_gpu_seq = fb->fPendingGpuSeq;
+ 			fb->fDirty = false;
+ 		}
+ 	}
+@@ -809,6 +818,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 		uint64_t before = fb->fPerfLog ? mach_absolute_time() : 0;
++#endif
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		herolte_gpu_wait_present(v_gpu_seq);
+ #endif
+ 		uint64_t bytes = fb->present(rec);
+ 		uint64_t gap = count - fb->fLastShown;
+@@ -1008,6 +1020,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	uint64_t seq = fPendingSeq = ++fSwapSeq;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	fPendingGpuSeq = herolte_gpu_tail_seq();
++#endif
+ 	fSwaps++;
+ 	fOverwritten += fDirty ? 1 : 0;
+ 	fDirty = true;
