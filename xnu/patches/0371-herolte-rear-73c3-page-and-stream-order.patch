@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 66e5699..fc31405 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2831,9 +2831,9 @@ nc_c3_i2c_read16(uint16_t reg)
+ 	return (uint16_t)((b[0] << 8) | b[1]);
+ }
+ 
+-/* Upload 73C3 firmware over SPI, boot ARM, configure mode & start 73C3 MIPI output. */
++/* Upload 73C3 firmware over SPI, boot ARM, run master/mode setfiles and ModeChange (call StreamOn after CSIS0 is ready). */
+ static bool
+-nc_c3_load_and_start(vm_offset_t pins, uint16_t *spi_id_out, uint16_t *ver_out, uint16_t *init_out)
++nc_c3_load_and_config(vm_offset_t pins, uint16_t *spi_id_out, uint16_t *ver_out, uint16_t *init_out)
+ {
+ 	nc_spi_init(pins);
+ 	uint16_t sid = nc_c3_spi_read16(pins, 0x0000);
+@@ -2850,18 +2850,22 @@ nc_c3_load_and_start(vm_offset_t pins, uint16_t *spi_id_out, uint16_t *ver_out,
+ 	nc_c3_spi_burst(pins, nc_c3_fw_buf, nc_c3_fw_len);
+ 	nc_c3_spi_write16(pins, 0x6048, 0x0001); /* ARM Reset & Memory Remap */
+ 	nc_c3_spi_write16(pins, 0x6014, 0x0001); /* ARM Go */
+-	ns_sleep_ms(10);
++	ns_sleep_ms(5);
+ 
++	/* USING_M2M_CAL_DATA = 0 (0x0044), then master setfile (0x6800=0, 0x0008=1) */
++	nc_c3_spi_write16(pins, 0x0044, 0x0000);
++	nc_c3_spi_write16(pins, 0x6800, 0x0000);
++	nc_c3_spi_write16(pins, 0x0008, 0x0001);
++	delay(2000);
++	nc_spi_deinit(pins);
++
++	/* Read chip version & api_init_done from 0x2000 page, configure api_* regs, then trigger ChangeConfig on 0x4000 page */
++	nc_sensor_write(0x3d, 0xfcfc, 0x2000, 16);
+ 	uint16_t ver = nc_c3_i2c_read16(0x0002);
+ 	uint16_t initd = nc_c3_i2c_read16(0x0008);
+ 	if (ver_out) { *ver_out = ver; }
+ 	if (init_out) { *init_out = initd; }
+ 
+-	/* Master & Mode setfile (companion_imx260_{master,mode}_setfile.bin) + ModeChange(idx=7) + StreamEnable */
+-	nc_c3_spi_write16(pins, 0x0008, 0x0000); /* using M2M cal = 0 */
+-	nc_c3_spi_write16(pins, 0x6800, 0x0000);
+-	nc_c3_spi_write16(pins, 0x0008, 0x0001);
+-	delay(1000);
+ 	nc_sensor_write(0x3d, 0x0042, (uint16_t)nc_o_rear_c3idx, 16); /* api_config_idx (7 = 2016x1512) */
+ 	nc_sensor_write(0x3d, 0x0990, 0x0000, 16);                   /* api_otf_WdrMode = off */
+ 	nc_sensor_write(0x3d, 0x0992, 0x0000, 16);                   /* api_otf_PowerMode = normal */
+@@ -2870,14 +2874,27 @@ nc_c3_load_and_start(vm_offset_t pins, uint16_t *spi_id_out, uint16_t *ver_out,
+ 	if (nc_o_rear_bypass) {
+ 		nc_sensor_write(0x3d, 0x003a, 0x0099, 16);           /* api_debug_out = Bypass ON */
+ 	}
++	nc_sensor_write(0x3d, 0xfcfc, 0x4000, 16);
+ 	nc_sensor_write(0x3d, 0x6802, 0x0001, 16);                   /* HOST_INTRP_ChangeConfig */
+-	delay(2000);
+-	nc_sensor_write(0x3d, 0x6800, 0x0001, 16);                   /* HOST_INTRP_StreamEnable */
+-	delay(1000);
+-	nc_spi_deinit(pins);
++	delay(3000);
+ 	return true;
+ }
+ 
++static void
++nc_c3_stream_on(void)
++{
++	nc_sensor_write(0x3d, 0xfcfc, 0x4000, 16);
++	nc_sensor_write(0x3d, 0x6800, 0x0001, 16);                   /* HOST_INTRP_StreamEnable = 1 */
++	ns_sleep_ms(10);                                             /* Samsung imx260: >= 8 ms before sensor stream_on */
++}
++
++static void
++nc_c3_stream_off(void)
++{
++	nc_sensor_write(0x3d, 0xfcfc, 0x4000, 16);
++	nc_sensor_write(0x3d, 0x6800, 0x0000, 16);                   /* HOST_INTRP_StreamEnable = 0 */
++}
++
+ static unsigned
+ nc_imx260_write_init(void)
+ {
+@@ -2992,7 +3009,7 @@ notefe_cam_rear_frame(vm_offset_t pins)
+ 	uint16_t c3_sid = 0, c3_ver = 0, c3_init = 0;
+ 	bool c3_fw = false;
+ 	if (nc_o_rear_comp && c73_ok) {
+-		c3_fw = nc_c3_load_and_start(pins, &c3_sid, &c3_ver, &c3_init);
++		c3_fw = nc_c3_load_and_config(pins, &c3_sid, &c3_ver, &c3_init);
+ 	}
+ 	uint32_t mmu_s = notefe_rd(mmu0, 0);
+ 	uint32_t iso_s = notefe_rd(pmu, 0x70c);
+@@ -3018,16 +3035,27 @@ notefe_cam_rear_frame(vm_offset_t pins)
+ 	}
+ 	nc_csis0_setup_4lane(csis0, nc_o_rear_settle, NC_REAR_W, NC_REAR_H);
+ 	uint32_t f0 = notefe_rd(csis0, 0x100);
++	if (nc_o_rear_comp && c3_fw) {
++		nc_c3_stream_on();
++	}
++	bad += !nc_sensor_write(0x1a, 0x0104, 0x01, 8);
+ 	bad += !nc_sensor_write(0x1a, 0x0100, 0x01, 8);
++	bad += !nc_sensor_write(0x1a, 0x0104, 0x00, 8);
+ 	ns_sleep_ms(600);
+ 	uint8_t sfc = 0, smode = 0;
+ 	(void)nc_sensor_read(0x1a, 0x0005, &sfc, 1);
+ 	(void)nc_sensor_read(0x1a, 0x0100, &smode, 1);
+-	uint16_t c3_fc = (nc_o_rear_comp && c3_fw) ? nc_c3_i2c_read16(0x0052) : 0;
+-	uint16_t c3_ow = (nc_o_rear_comp && c3_fw) ? nc_c3_i2c_read16(0x00cc) : 0;
+-	uint16_t c3_oh = (nc_o_rear_comp && c3_fw) ? nc_c3_i2c_read16(0x00ce) : 0;
++	uint16_t c3_fc = 0, c3_ow = 0, c3_oh = 0, c3_fe = 0, c3_fi = 0, c3_ec = 0, c3_c0 = 0;
+ 	if (nc_o_rear_comp && c3_fw) {
+-		(void)nc_sensor_write(0x3d, 0x6800, 0x0000, 16);
++		nc_sensor_write(0x3d, 0xfcfc, 0x2000, 16);
++		c3_fc = nc_c3_i2c_read16(0x0052);
++		c3_ow = nc_c3_i2c_read16(0x00cc);
++		c3_oh = nc_c3_i2c_read16(0x00ce);
++		c3_fe = nc_c3_i2c_read16(0x0ff6);
++		c3_fi = nc_c3_i2c_read16(0x0ff8);
++		c3_ec = nc_c3_i2c_read16(0x0ffe);
++		c3_c0 = nc_c3_i2c_read16(0x0fd0);
++		nc_c3_stream_off();
+ 	}
+ 	uint32_t f1 = notefe_rd(csis0, 0x100);
+ 	uint32_t dphy = notefe_rd(csis0, 0x20);
+@@ -3077,8 +3105,8 @@ notefe_cam_rear_frame(vm_offset_t pins)
+ 	NC_SDA = 2; NC_SCL = 3;
+ 
+ 	snprintf(nc_rear_info, sizeof(nc_rear_info),
+-	    "imx260 c3(spi=%#x v=%#x init=%#x fc=%u out=%ux%u) sfc=%u csis0=%u->%u dphy=%#x irq=%#x/%#x chg=%u",
+-	    c3_sid, c3_ver, c3_init, c3_fc, c3_ow, c3_oh, sfc, f0, f1, dphy, irq0, irq1, changed);
++	    "c3(v=%#x in=%#x fc=%u %ux%u err=%#x/%#x#%u c0=%u) sfc=%u csis0=%u->%u dphy=%#x irq=%#x/%#x chg=%u",
++	    c3_ver, c3_init, c3_fc, c3_ow, c3_oh, c3_fe, c3_fi, c3_ec, c3_c0, sfc, f0, f1, dphy, irq0, irq1, changed);
+ 	printf("NOTEFE CAM: rear frame: %s\n", nc_rear_info);
+ }
+ 
+@@ -3551,7 +3579,7 @@ nc_stream_up(void)
+ 			return EIO;
+ 		}
+ 		unsigned bad = nc_imx260_write_init();
+-		(void)nc_c3_load_and_start(pins, NULL, NULL, NULL);
++		(void)nc_c3_load_and_config(pins, NULL, NULL, NULL);
+ 		notefe_wr(nc_s.cam0, 0x800, notefe_rd(nc_s.cam0, 0x800) | 1u);
+ 		notefe_wr(nc_s.cam0, 0x804, notefe_rd(nc_s.cam0, 0x804) | 1u);
+ 		if (nc_s.cam0_loc) {
+@@ -3580,7 +3608,10 @@ nc_stream_up(void)
+ 		}
+ 		nc_last_frm = notefe_rd(nc_s.csis0, 0x100);
+ 		nc_seq = 0; nc_reads = 0; nc_torn = 0;
++		nc_c3_stream_on();
++		nc_sensor_write(0x1a, 0x0104, 1, 8);
+ 		nc_sensor_write(0x1a, 0x0100, 1, 8);
++		nc_sensor_write(0x1a, 0x0104, 0, 8);
+ 		printf("NOTEFE CAM: rear stream: up, IMX260 %u x %u 4-lane, %u bad writes\n", nc_w, nc_h, bad);
+ 		return 0;
+ 	}
+@@ -3688,7 +3719,7 @@ nc_stream_down(void)
+ 	if (nc_is_rear) {
+ 		NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
+ 		nc_sensor_write(0x1a, 0x0100, 0, 8);
+-		nc_sensor_write(0x3d, 0x6800, 0, 16);
++		nc_c3_stream_off();
+ 		delay(40000);
+ 		if (nc_s.csis0 && nc_s.cam0 && notefe_rd(nc_s.cam0, 0x220) != nc_s.rx_mux[0]) {
+ 			notefe_wr(nc_s.csis0, 0x1000, notefe_rd(nc_s.csis0, 0x1000) | 1u);
