@@ -220,7 +220,7 @@ bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.23 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double target = 0.28 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
@@ -1091,27 +1091,23 @@ isp_render_cells(const struct isp *isp, const struct hakios_camera_frame *f, con
 	if (r0 >= r1) {
 		return;
 	}
+	int *up = rowbuf[0], *mid = rowbuf[1], *dn = rowbuf[2];
 	int cur_y = (int)(sy0 + (isp->turned ? (ch - 1 - r0) : r0));
-	unpack_line(f, raw, cur_y - 1, rowbuf[0]);
-	unpack_line(f, raw, cur_y,     rowbuf[1]);
-	unpack_line(f, raw, cur_y + 1, rowbuf[2]);
+	unpack_line(f, raw, cur_y - 1, up);
+	unpack_line(f, raw, cur_y,     mid);
+	unpack_line(f, raw, cur_y + 1, dn);
 
 	for (uint32_t row = r0; row < r1; row++) {
 		int y = (int)(sy0 + (isp->turned ? (ch - 1 - row) : row));
 		if (row > r0) {
 			if (isp->turned) {
-				/* y decreased by 1 */
-				memcpy(rowbuf[2], rowbuf[1], f->width * sizeof(int));
-				memcpy(rowbuf[1], rowbuf[0], f->width * sizeof(int));
-				unpack_line(f, raw, y - 1, rowbuf[0]);
+				int *tmp = dn; dn = mid; mid = up; up = tmp;
+				unpack_line(f, raw, y - 1, up);
 			} else {
-				/* y increased by 1 */
-				memcpy(rowbuf[0], rowbuf[1], f->width * sizeof(int));
-				memcpy(rowbuf[1], rowbuf[2], f->width * sizeof(int));
-				unpack_line(f, raw, y + 1, rowbuf[2]);
+				int *tmp = up; up = mid; mid = dn; dn = tmp;
+				unpack_line(f, raw, y + 1, dn);
 			}
 		}
-		const int *up = rowbuf[0], *mid = rowbuf[1], *dn = rowbuf[2];
 		uint8_t *dst = cells + (size_t)row * cw * 3;
 		int row_c0 = colour[(y & 1) * 2 + 0];
 		int row_c1 = colour[(y & 1) * 2 + 1];
@@ -1153,40 +1149,40 @@ isp_render_cells(const struct isp *isp, const struct hakios_camera_frame *f, con
 	}
 }
 
-/* Lightweight 3x3 unsharp mask on NV12 Y plane (strength in 1/16ths, e.g. 6 = 0.375x). */
+/* Lightweight unsharp mask on NV12 Y plane (strength in 1/16ths; 2px radius on 4K upscaled stills). */
 void
 isp_sharpen_y(uint8_t *y, size_t y_stride, uint32_t width, uint32_t height, int strength16)
 {
-	if (width < 4 || height < 4 || strength16 <= 0) {
+	uint32_t rad = width > 2000 ? 2u : 1u;
+	if (width <= rad * 2 + 2 || height <= rad * 2 + 2 || strength16 <= 0) {
 		return;
 	}
-	uint8_t *prev = malloc(width);
-	uint8_t *cur = malloc(width);
-	if (prev == NULL || cur == NULL) {
-		free(prev);
-		free(cur);
+	uint8_t *ring[3] = { malloc(width), malloc(width), malloc(width) };
+	if (!ring[0] || !ring[1] || !ring[2]) {
+		free(ring[0]); free(ring[1]); free(ring[2]);
 		return;
 	}
-	memcpy(prev, y, width);
-	memcpy(cur, y + y_stride, width);
-	for (uint32_t r = 1; r + 1 < height; r++) {
+	/* Keep rad+1 unmodified source rows so in-place writes never feed back into subsequent rows. */
+	for (uint32_t r = 0; r < rad; r++) {
+		memcpy(ring[r], y + (size_t)r * y_stride, width);
+	}
+	for (uint32_t r = rad; r + rad < height; r++) {
 		uint8_t *out = y + (size_t)r * y_stride;
-		const uint8_t *next = y + (size_t)(r + 1) * y_stride;
-		for (uint32_t x = 1; x + 1 < width; x++) {
+		const uint8_t *up = ring[(r - rad) % (rad + 1)];
+		const uint8_t *dn = y + (size_t)(r + rad) * y_stride;
+		uint8_t *cur = ring[r % (rad + 1)];
+		memcpy(cur, out, width);
+		for (uint32_t x = rad; x + rad < width; x++) {
 			int c = cur[x];
-			int blur = (prev[x] + next[x] + cur[x - 1] + cur[x + 1] + 2) >> 2;
+			int blur = (up[x] + dn[x] + cur[x - rad] + cur[x + rad] + 2) >> 2;
 			int diff = c - blur;
-			/* Soft noise coring: ignore +/-2 luma sensor noise */
 			if (diff > 2 || diff < -2) {
 				int v = c + ((diff * strength16) >> 4);
 				out[x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
 			}
 		}
-		memcpy(prev, cur, width);
-		memcpy(cur, next, width);
 	}
-	free(prev);
-	free(cur);
+	free(ring[0]); free(ring[1]); free(ring[2]);
 }
 
 static void
