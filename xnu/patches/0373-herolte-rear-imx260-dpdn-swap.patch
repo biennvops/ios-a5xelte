@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 53e9a10..d9dcad2 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2908,18 +2908,19 @@ nc_imx260_write_init(void)
+ 		bad += !nc_sensor_write(0x1a, nc_imx260_2016[i].reg, nc_imx260_2016[i].val, 8);
+ 	}
+ 	if (nc_o_rear_swap == 0) {
+-		/* Samsung fimc-is-cis-imx260.c physical PCB MIPI lane mapping */
+-		bad += !nc_sensor_write(0x1a, 0x40ad, 0x00, 8);
++		/* Galaxy S7 / S7 Edge (fimc_is_fw2_imx260.bin IMX260_DPDN_D0D2_Swap): DPDN_SWAP=1, lanes 02,01,03,00 */
++		bad += !nc_sensor_write(0x1a, 0x40ad, 0x01, 8);
+ 		bad += !nc_sensor_write(0x1a, 0x40b8, 0x02, 8);
+ 		bad += !nc_sensor_write(0x1a, 0x40b9, 0x01, 8);
+ 		bad += !nc_sensor_write(0x1a, 0x40ba, 0x03, 8);
+ 		bad += !nc_sensor_write(0x1a, 0x40bb, 0x00, 8);
+ 	} else if (nc_o_rear_swap == 1) {
+-		bad += !nc_sensor_write(0x1a, 0x40ad, 0x00, 8);
++		/* Alternate S7 module rev (D0D2_SWAP=YES): DPDN_SWAP=1, lanes 00,01,03,02 */
++		bad += !nc_sensor_write(0x1a, 0x40ad, 0x01, 8);
+ 		bad += !nc_sensor_write(0x1a, 0x40b8, 0x00, 8);
+ 		bad += !nc_sensor_write(0x1a, 0x40b9, 0x01, 8);
+-		bad += !nc_sensor_write(0x1a, 0x40ba, 0x02, 8);
+-		bad += !nc_sensor_write(0x1a, 0x40bb, 0x03, 8);
++		bad += !nc_sensor_write(0x1a, 0x40ba, 0x03, 8);
++		bad += !nc_sensor_write(0x1a, 0x40bb, 0x02, 8);
+ 	}
+ 	bad += !nc_sensor_write(0x1a, 0x0101, (uint16_t)(nc_o_rear_flip & 3u), 8);
+ 	bad += !nc_sensor_write(0x1a, 0x0202, 0x0300, 16);
