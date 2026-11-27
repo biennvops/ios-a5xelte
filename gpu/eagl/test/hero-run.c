@@ -1260,11 +1260,16 @@ ssh_start(void)
    chmod("/var/root/.ssh/authorized_keys", 0600);
 
    kill_by_name("dropbear", SIGKILL);
+   posix_spawn_file_actions_t fa;
+   posix_spawn_file_actions_init(&fa);
+   posix_spawn_file_actions_addopen(&fa, 1, DROP_DIR "ssh/dropbear.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   posix_spawn_file_actions_adddup2(&fa, 1, 2);
    char *argv[] = {
-      (char *)db, "-s", "-g", "-E", "-p", "22", "-r", (char *)hk, NULL
+      (char *)db, "-F", "-E", "-p", "22", "-P", DROP_DIR "ssh/dropbear.pid", "-r", (char *)hk, NULL
    };
    pid_t pid = 0;
-   int err = posix_spawn(&pid, db, NULL, NULL, argv, environ);
+   int err = posix_spawn(&pid, db, &fa, NULL, argv, environ);
+   posix_spawn_file_actions_destroy(&fa);
    herodrm_log("hero-run: dropbear sshd (key-only :22): %s (pid %d, err %d)",
        err == 0 ? "started" : "failed", (int)pid, err);
 }
