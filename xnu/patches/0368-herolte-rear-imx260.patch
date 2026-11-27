@@ -1,0 +1,455 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index b858569..9399038 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1917,6 +1917,11 @@ static void notefe_cam_front_id(vm_offset_t pins);
+ static void notefe_cam_csis_look(void);
+ static void notefe_cam_frame(vm_offset_t pins);
+ static void notefe_cam_rear_id(vm_offset_t pins);
++static void notefe_cam_rear_frame(vm_offset_t pins);
++static uint32_t nc_o_rear_en = 0, nc_o_rear_settle = 30, nc_o_rear_flip = 0;
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_en, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_en, 0, "Enable live rear IMX260 camera switching in /dev/hakios-camera");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_settle, 0, "Rear IMX260 CSIS0 HS settle");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_flip, 0, "Rear IMX260 0x0101 flip (0..3)");
+ static char nc_rear_info[256] = "not probed";
+ SYSCTL_STRING(_kern, OID_AUTO, notefe_cam_rear, CTLFLAG_RD | CTLFLAG_LOCKED, nc_rear_info, sizeof(nc_rear_info), "Rear camera Stage 1 probe result");
+ static void nc_dev_make(void);
+@@ -1997,6 +2002,9 @@ notefe_cam_probe(int level)
+ 	if (level == 9) {
+ 		notefe_cam_rear_id(pins);
+ 	}
++	if (level == 10) {
++		notefe_cam_rear_frame(pins);
++	}
+ }
+ 
+ /*
+@@ -2599,6 +2607,218 @@ nc_csis_setup(vm_offset_t csis, uint32_t settle)
+  * pattern kept, 8 bits (value >> 2), after an 8-byte header (width, height). Read through the frame's one permanent
+  * mapping (notefe_physmap). sysctl kern.notefe_cam_pic (root) hands it out; the bot writes it to the drop zone.
+  */
++static const struct { uint16_t reg; uint8_t val; } nc_imx260_global[] = {
++	{ 0x0136, 0x1a }, { 0x0137, 0x00 }, { 0x304c, 0x00 }, { 0x307d, 0x01 }, { 0x30f0, 0x02 }, { 0x30f1, 0x02 },
++	{ 0x5812, 0x04 }, { 0x5813, 0x04 }, { 0x58d0, 0x07 }, { 0x58e4, 0x01 }, { 0x5e6c, 0x01 }, { 0x5f20, 0x01 },
++	{ 0x5fd5, 0x0e }, { 0x5fd7, 0x62 }, { 0x5fe1, 0x00 }, { 0x5fe3, 0x54 }, { 0x5fe5, 0x0e }, { 0x5fe7, 0x62 },
++	{ 0x5fed, 0x0e }, { 0x5fef, 0x62 }, { 0x687d, 0x8e }, { 0x687e, 0x01 }, { 0x687f, 0xa7 }, { 0x72a1, 0x05 },
++	{ 0x72c9, 0x84 }, { 0x72ce, 0x19 }, { 0x72e2, 0x65 }, { 0x72e3, 0x96 }, { 0x72e4, 0x59 }, { 0x72e8, 0x96 },
++	{ 0x72e9, 0x59 }, { 0x72ea, 0x65 }, { 0x72eb, 0x2d }, { 0x72ec, 0xdd }, { 0x72ed, 0xd9 }, { 0x72ee, 0x7f },
++	{ 0x72ef, 0x9a }, { 0x72f0, 0x17 }, { 0x72f1, 0xf3 }, { 0x72f2, 0x3f }, { 0x72f3, 0xf3 }, { 0x72f4, 0x3f },
++	{ 0x72f7, 0xf3 }, { 0x72f8, 0x3f }, { 0x72fb, 0x2c }, { 0x7333, 0xbf }, { 0x7334, 0xf3 }, { 0x7338, 0xff },
++	{ 0x7339, 0xf6 }, { 0x734a, 0x23 }, { 0x734d, 0x00 }, { 0x734f, 0x64 }, { 0x7350, 0x00 }, { 0x7360, 0x02 },
++	{ 0x7361, 0x30 }, { 0x7363, 0x00 }, { 0x7366, 0x10 }, { 0x7367, 0x00 }, { 0x7368, 0x23 }, { 0x736b, 0x00 },
++	{ 0x736d, 0x39 }, { 0x736e, 0x00 }, { 0x7377, 0x23 }, { 0x737a, 0x00 }, { 0x737c, 0x64 }, { 0x737d, 0x00 },
++	{ 0x7441, 0x84 }, { 0x7447, 0x62 }, { 0x744f, 0x0e }, { 0x747d, 0x3a }, { 0x7483, 0x54 }, { 0x748b, 0x00 },
++	{ 0x7491, 0x60 }, { 0x7497, 0x62 }, { 0x749f, 0x0e }, { 0x74b9, 0x55 }, { 0x74bf, 0x62 }, { 0x74c7, 0x0e },
++	{ 0x7932, 0x00 }, { 0x7937, 0x01 }, { 0x793c, 0x01 }, { 0x793d, 0x02 }, { 0x7947, 0x03 }, { 0x811f, 0x01 },
++	{ 0x9333, 0x03 }, { 0x9334, 0x04 }, { 0x9335, 0x05 }, { 0x9346, 0x96 }, { 0x934a, 0x8c }, { 0x9352, 0xaa },
++	{ 0xb011, 0x00 }, { 0xb01e, 0x00 }, { 0xb01f, 0x00 }, { 0xb020, 0x00 }, { 0xb021, 0x00 }, { 0xb03c, 0x03 },
++	{ 0xb03d, 0x03 }, { 0xb03e, 0x03 }, { 0xb03f, 0x03 }, { 0xb0b6, 0x05 }, { 0xb0b7, 0x05 }, { 0xb0b8, 0x06 },
++	{ 0xb0b9, 0x05 }, { 0xb0ba, 0x06 }, { 0xb0bb, 0x06 }, { 0xb0bc, 0x06 }, { 0xb0bd, 0x06 }, { 0xb0be, 0x06 },
++	{ 0xb0bf, 0x06 }, { 0xb0c0, 0x06 }, { 0xb0c1, 0x06 }, { 0xb0c2, 0x06 }, { 0xb0c3, 0x06 }, { 0xb0c4, 0x06 },
++	{ 0xb0c5, 0x06 }, { 0xb0e0, 0x31 }, { 0xb0e1, 0x31 }, { 0xb0e3, 0x26 }, { 0xb0f1, 0x05 }, { 0xbc7b, 0xd4 },
++	{ 0xbc81, 0x74 }, { 0xbc83, 0x44 }, { 0xbc86, 0x07 }, { 0xbc87, 0x18 }, { 0x5e64, 0x01 }, { 0x5fe0, 0x00 },
++	{ 0x5fe1, 0xfb }, { 0x5fe3, 0x4f }, { 0x628d, 0x01 }, { 0x6434, 0x01 }, { 0x6435, 0x22 }, { 0x6436, 0x00 },
++	{ 0x6437, 0xc5 }, { 0x6604, 0x01 }, { 0x6605, 0x22 }, { 0x6606, 0x00 }, { 0x6607, 0xc5 }, { 0x660c, 0x00 },
++	{ 0x660d, 0x00 }, { 0x660e, 0x03 }, { 0x660f, 0xff }, { 0x6614, 0x00 }, { 0x6615, 0xd3 }, { 0x6616, 0x01 },
++	{ 0x6617, 0x22 }, { 0x6b7d, 0x32 }, { 0x7366, 0xb0 }, { 0x7483, 0x4f }, { 0x748a, 0x00 }, { 0x748b, 0xfb },
++	{ 0xbc81, 0x60 }, { 0x5e6f, 0x3f }, { 0x5e72, 0x01 }, { 0x7912, 0x01 },
++};
++static const struct { uint16_t reg; uint8_t val; } nc_imx260_2016[] = {
++	{ 0x9007, 0x00 }, { 0x30f2, 0x00 }, { 0x0112, 0x0a }, { 0x0113, 0x0a }, { 0x0114, 0x03 }, { 0x0220, 0x00 },
++	{ 0x0221, 0x11 }, { 0x0340, 0x06 }, { 0x0341, 0x40 }, { 0x0342, 0x44 }, { 0x0343, 0x00 }, { 0x0381, 0x01 },
++	{ 0x0383, 0x01 }, { 0x0385, 0x01 }, { 0x0387, 0x01 }, { 0x0900, 0x01 }, { 0x0901, 0x22 }, { 0x30f4, 0x02 },
++	{ 0x30f5, 0x8a }, { 0x30f6, 0x00 }, { 0x30f7, 0x14 }, { 0x31a0, 0x02 }, { 0x31a3, 0x01 }, { 0x31a5, 0x00 },
++	{ 0x31a6, 0x00 }, { 0x560f, 0xc8 }, { 0x0344, 0x00 }, { 0x0345, 0x00 }, { 0x0346, 0x00 }, { 0x0347, 0x00 },
++	{ 0x0348, 0x0f }, { 0x0349, 0xbf }, { 0x034a, 0x0b }, { 0x034b, 0xcf }, { 0x034c, 0x07 }, { 0x034d, 0xe0 },
++	{ 0x034e, 0x05 }, { 0x034f, 0xe8 }, { 0x0408, 0x00 }, { 0x0409, 0x00 }, { 0x040a, 0x00 }, { 0x040b, 0x00 },
++	{ 0x040c, 0x07 }, { 0x040d, 0xe0 }, { 0x040e, 0x05 }, { 0x040f, 0xe8 }, { 0x0301, 0x03 }, { 0x0303, 0x02 },
++	{ 0x0305, 0x04 }, { 0x0306, 0x00 }, { 0x0307, 0xc1 }, { 0x0309, 0x0a }, { 0x030b, 0x01 }, { 0x030d, 0x04 },
++	{ 0x030e, 0x01 }, { 0x030f, 0x3c }, { 0x0310, 0x01 },
++};
++
++#define NC_REAR_W 2016u
++#define NC_REAR_H 1512u
++
++static void
++nc_csis0_setup_4lane(vm_offset_t csis, uint32_t settle, uint32_t w, uint32_t h)
++{
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) & ~1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
++	for (unsigned n = 0; n < 100 && (notefe_rd(csis, 0x4) & 2u); n++) {
++		delay(10);
++	}
++	for (unsigned vc = 0; vc < 4; vc++) {
++		notefe_wr(csis, 0x1000 + vc * 0x100, (notefe_rd(csis, 0x1000 + vc * 0x100) | 1u) & ~2u);
++	}
++	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | ((settle & 0xffu) << 24) | (0xfu << 1));
++	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (3u << 8));
++	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
++	notefe_wr(csis, 0x44, (h << 16) | w);
++	notefe_wr(csis, 0x1004, notefe_rd(csis, 0x1004) & ~(3u << 14));
++	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
++		notefe_wr(csis, a, NC_BUF);
++	}
++	notefe_wr(csis, 0x1000, (notefe_rd(csis, 0x1000) & ~1u) | 2u);
++	notefe_wr(csis, 0x14, notefe_rd(csis, 0x14));
++	notefe_wr(csis, 0x1c, notefe_rd(csis, 0x1c));
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | (0xfu << 16));
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) | 1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 1u);
++}
++
++static unsigned
++nc_imx260_write_init(void)
++{
++	unsigned bad = 0;
++	bad += !nc_sensor_write(0x1a, 0x0100, 0x00, 8);
++	for (unsigned i = 0; i < sizeof(nc_imx260_global) / sizeof(nc_imx260_global[0]); i++) {
++		bad += !nc_sensor_write(0x1a, nc_imx260_global[i].reg, nc_imx260_global[i].val, 8);
++	}
++	for (unsigned i = 0; i < sizeof(nc_imx260_2016) / sizeof(nc_imx260_2016[0]); i++) {
++		bad += !nc_sensor_write(0x1a, nc_imx260_2016[i].reg, nc_imx260_2016[i].val, 8);
++	}
++	bad += !nc_sensor_write(0x1a, 0x0101, (uint16_t)(nc_o_rear_flip & 3u), 8);
++	bad += !nc_sensor_write(0x1a, 0x0202, 0x0300, 16);
++	bad += !nc_sensor_write(0x1a, 0x0204, 0x0100, 16);
++	return bad;
++}
++
++static void
++notefe_cam_rear_frame(vm_offset_t pins)
++{
++	static vm_offset_t top, csis0, phy0, pmu, mmu0, cam0;
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++		csis0 = ml_io_map(0x14000000u, 0x2000);
++		phy0 = ml_io_map(0x144f1000u, 0x1000);
++		pmu = ml_io_map(0x105c0000u, 0x1000);
++		mmu0 = ml_io_map(0x140e0000u, 0x1000);
++		cam0 = ml_io_map(0x144d0000u, 0x1000);
++	}
++	if (!nc_frame_c) {
++		nc_frame_c = notefe_physmap_cached(NC_BUF, NC_MAP_LEN);
++	}
++	if (!top || !csis0 || !phy0 || !pmu || !mmu0 || !cam0 || !nc_frame_c) {
++		snprintf(nc_rear_info, sizeof(nc_rear_info), "rear frame: map failed");
++		return;
++	}
++	nc_pins = pins;
++	uint32_t gcon = notefe_rd(pins, 0x40);
++	if (((gcon >> 16) & 0xf) != 2 || ((gcon >> 20) & 0xf) != 2) {
++		nc_pin(pins, 0x40, 4, 2, -1, -1);
++		nc_pin(pins, 0x40, 5, 2, -1, -1);
++	}
++	nc_bus_init();
++	uint8_t l3 = 0, l7 = 0, l10 = 0, l11 = 0, l12 = 0;
++	if (!nc_read(0x59, 0x20, &l3, 1) || !nc_read(0x59, 0x24, &l7, 1) ||
++	    !nc_read(0x59, 0x27, &l10, 1) || !nc_read(0x59, 0x28, &l11, 1) ||
++	    !nc_read(0x59, 0x29, &l12, 1)) {
++		snprintf(nc_rear_info, sizeof(nc_rear_info), "rear frame: S2MPB02 fail");
++		return;
++	}
++	memset((void *)nc_frame_c, 0xa5, 65536);
++	flush_dcache(nc_frame_c, 65536, 0);
++
++	nc_pin(pins, 0x120, 0, 1, 0, 0);
++	nc_pin(pins, 0x120, 2, 1, 0, 0);
++	NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
++	nc_line(NC_SDA, 1);
++	nc_line(NC_SCL, 1);
++	nc_pmic_write(0x29, 0x80 | 0x58);
++	delay(2000);
++	nc_pmic_write(0x28, 0x80 | 0x18);
++	delay(200);
++	nc_pmic_write(0x28, 0x80 | 0x5b);
++	nc_pmic_write(0x27, 0x80 | 0x33);
++	nc_pmic_write(0x20, 0x80 | 0x24);
++	nc_pmic_write(0x24, 0x80 | 0x30);
++	delay(2000);
++	uint32_t mux = notefe_rd(top, 0xb00), div = notefe_rd(top, 0xb04);
++	notefe_wr(top, 0xb00, mux & ~(7u << 12));
++	for (unsigned n = 0; n < 1000 && ((notefe_rd(top, 0xb08) >> 12) & 7) != 0; n++) { delay(1); }
++	notefe_wr(top, 0xb04, div & ~0xffu);
++	nc_pin(pins, 0x180, 0, 2, -1, -1);
++	delay(2000);
++	nc_pin(pins, 0x120, 0, 1, 0, 1);
++	delay(10000);
++
++	unsigned bad = nc_imx260_write_init();
++	uint32_t mmu_s = notefe_rd(mmu0, 0);
++	uint32_t iso_s = notefe_rd(pmu, 0x70c);
++	uint32_t phy_s = notefe_rd(phy0, 0x40);
++	uint32_t rx_m[4], rx_g[4];
++	notefe_wr(mmu0, 0, 0);
++	notefe_wr(pmu, 0x70c, iso_s | 1u);
++	notefe_wr(phy0, 0x40, phy_s & ~2u);
++	delay(10);
++	notefe_wr(phy0, 0x40, phy_s | 2u);
++	for (unsigned n = 0; n < 4; n++) {
++		rx_m[n] = notefe_rd(cam0, 0x220 + 4 * n);
++		rx_g[n] = notefe_rd(cam0, 0x848 + 4 * n);
++		notefe_wr(cam0, 0x220 + 4 * n, rx_m[n] | (1u << 12));
++		notefe_wr(cam0, 0x848 + 4 * n, rx_g[n] | 1u);
++	}
++	nc_csis0_setup_4lane(csis0, nc_o_rear_settle, NC_REAR_W, NC_REAR_H);
++	uint32_t f0 = notefe_rd(csis0, 0x100);
++	bad += !nc_sensor_write(0x1a, 0x0100, 0x01, 8);
++	ns_sleep_ms(600);
++	uint8_t sfc = 0, smode = 0;
++	(void)nc_sensor_read(0x1a, 0x0005, &sfc, 1);
++	(void)nc_sensor_read(0x1a, 0x0100, &smode, 1);
++	uint32_t f1 = notefe_rd(csis0, 0x100);
++	uint32_t dphy = notefe_rd(csis0, 0x28);
++	uint32_t irq0 = notefe_rd(csis0, 0x14), irq1 = notefe_rd(csis0, 0x1c);
++	uint32_t act = notefe_rd(csis0, 0x1030);
++	flush_dcache(nc_frame_c, 65536, 0);
++	unsigned changed = 0;
++	const uint8_t *bp = (const uint8_t *)nc_frame_c;
++	for (unsigned i = 0; i < 65536; i++) {
++		if (bp[i] != 0xa5) { changed++; }
++	}
++
++	(void)nc_sensor_write(0x1a, 0x0100, 0x00, 8);
++	delay(30000);
++	notefe_wr(csis0, 0x1000, notefe_rd(csis0, 0x1000) | 1u);
++	notefe_wr(csis0, 0x4, notefe_rd(csis0, 0x4) & ~1u);
++	notefe_wr(csis0, 0x24, notefe_rd(csis0, 0x24) & ~1u);
++	notefe_wr(csis0, 0x4, notefe_rd(csis0, 0x4) | 2u);
++	for (unsigned n = 0; n < 4; n++) {
++		notefe_wr(cam0, 0x220 + 4 * n, rx_m[n]);
++		notefe_wr(cam0, 0x848 + 4 * n, rx_g[n]);
++	}
++	notefe_wr(phy0, 0x40, phy_s);
++	notefe_wr(pmu, 0x70c, iso_s);
++	notefe_wr(mmu0, 0, mmu_s);
++	nc_pin(pins, 0x120, 0, 1, 0, 0);
++	nc_pin(pins, 0x180, 0, 0, -1, -1);
++	notefe_wr(top, 0xb04, div);
++	notefe_wr(top, 0xb00, mux);
++	nc_pmic_write(0x29, l12 & 0x7f);
++	nc_pmic_write(0x24, l7 & 0x7f);
++	nc_pmic_write(0x20, l3 & 0x7f);
++	nc_pmic_write(0x27, l10 & 0x7f);
++	nc_pmic_write(0x28, l11 & 0x7f);
++	NC_SDA = 2; NC_SCL = 3;
++
++	snprintf(nc_rear_info, sizeof(nc_rear_info),
++	    "imx260 2016x1512: bad=%u mode=%#x sfc=%u csis0_f=%u->%u dphy=%#x irq=%#x/%#x act=%#x chg=%u/65536",
++	    bad, smode, sfc, f0, f1, dphy, irq0, irq1, act, changed);
++	printf("NOTEFE CAM: rear frame: %s\n", nc_rear_info);
++}
++
+ static uint8_t *nc_pic;
+ static uint32_t nc_pic_len;
+ static vm_offset_t nc_frame;            /* NC_BUF, a whole full-size frame, mapped once */
+@@ -2923,9 +3143,12 @@ static uint16_t *nc_copy;               /* 0457: the finished slot copied out at
+ static uint64_t nc_seq, nc_user_exp_until;
+ static uint32_t nc_sensor_id = 2;       /* 0463: the number the frames carry: whatever HAKIOS_CAMERA_SENSOR asked for (one camera
+                                          * here, so the back and the front streams both get its frames, as on the S9) */
++static bool nc_is_rear;
+ static struct {
+ 	vm_offset_t top, csis, phy, pmu, mmu, cam1, pins;
++	vm_offset_t csis0, phy0, mmu0, cam0;
+ 	uint8_t l5, l6, l7, l13;
++	uint8_t rl3, rl7, rl10, rl11, rl12;
+ 	uint32_t div, mux, mmu_ctrl, iso, phyc, rx_mux[4], rx_gate[4];
+ } nc_s;
+ 
+@@ -2940,6 +3163,10 @@ nc_stream_maps(void)
+ 		nc_s.mmu = ml_io_map(0x141e0000u, 0x1000);
+ 		nc_s.cam1 = ml_io_map(0x145d0000u, 0x1000);
+ 		nc_s.pins = ml_io_map(0x136d0000u, 0x1000);
++		nc_s.csis0 = ml_io_map(0x14000000u, 0x2000);
++		nc_s.phy0 = ml_io_map(0x144f1000u, 0x1000);
++		nc_s.mmu0 = ml_io_map(0x140e0000u, 0x1000);
++		nc_s.cam0 = ml_io_map(0x144d0000u, 0x1000);
+ 	}
+ 	if (!nc_i2c) {
+ 		nc_i2c = ml_io_map(0x13680000u, 0x1000);
+@@ -2953,6 +3180,19 @@ nc_stream_maps(void)
+ static void
+ nc_set_exposure(uint32_t lines, uint32_t gain)
+ {
++	if (nc_is_rear) {
++		NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
++		nc_exp = MIN(MAX(lines, 4), 1580);
++		nc_gain = MIN(MAX(gain, 0x20), 0x200);
++		uint32_t code = nc_gain > 0x20 ? (512u - (512u * 0x20u) / nc_gain) : 0u;
++		if (code > 480u) { code = 480u; }
++		nc_sensor_write(0x1a, 0x0104, 1, 8);
++		nc_sensor_write(0x1a, 0x0202, (uint16_t)nc_exp, 16);
++		nc_sensor_write(0x1a, 0x0204, (uint16_t)code, 16);
++		nc_sensor_write(0x1a, 0x0104, 0, 8);
++		return;
++	}
++	NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
+ 	nc_exp = MIN(MAX(lines, 4), 2036);
+ 	nc_gain = MIN(MAX(gain, 0x20), 0x200);
+ 	nc_sensor_write(0x35, 0x0104, 1, 8);
+@@ -2973,6 +3213,77 @@ nc_stream_up(void)
+ 	}
+ 	vm_offset_t pins = nc_s.pins;
+ 	nc_pins = pins;
++	nc_is_rear = (nc_o_rear_en != 0 && nc_sensor_id == 1);
++	if (nc_is_rear) {
++		NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
++		uint32_t con = notefe_rd(pins, 0x40);
++		if (((con >> 16) & 0xf) != 2 || ((con >> 20) & 0xf) != 2) {
++			nc_pin(pins, 0x40, 4, 2, -1, -1);
++			nc_pin(pins, 0x40, 5, 2, -1, -1);
++		}
++		nc_bus_init();
++		if (!nc_read(0x59, 0x20, &nc_s.rl3, 1) || !nc_read(0x59, 0x24, &nc_s.rl7, 1) ||
++		    !nc_read(0x59, 0x27, &nc_s.rl10, 1) || !nc_read(0x59, 0x28, &nc_s.rl11, 1) ||
++		    !nc_read(0x59, 0x29, &nc_s.rl12, 1)) {
++			printf("NOTEFE CAM: rear stream: S2MPB02 fail\n");
++			return EIO;
++		}
++		nc_pin(pins, 0x120, 0, 1, 0, 0);
++		nc_pin(pins, 0x120, 2, 1, 0, 0);
++		nc_line(NC_SDA, 1);
++		nc_line(NC_SCL, 1);
++		nc_pmic_write(0x29, 0x80 | 0x58);
++		delay(2000);
++		nc_pmic_write(0x28, 0x80 | 0x18);
++		delay(200);
++		nc_pmic_write(0x28, 0x80 | 0x5b);
++		nc_pmic_write(0x27, 0x80 | 0x33);
++		nc_pmic_write(0x20, 0x80 | 0x24);
++		nc_pmic_write(0x24, 0x80 | 0x30);
++		delay(2000);
++		nc_s.div = notefe_rd(nc_s.top, 0xb04);
++		nc_s.mux = notefe_rd(nc_s.top, 0xb00);
++		notefe_wr(nc_s.top, 0xb00, nc_s.mux & ~(7u << 12));
++		delay(100);
++		notefe_wr(nc_s.top, 0xb04, nc_s.div & ~0xffu);
++		nc_pin(pins, 0x180, 0, 2, -1, -1);
++		delay(2000);
++		nc_pin(pins, 0x120, 0, 1, 0, 1);
++		delay(10000);
++		nc_streaming = true;
++		uint8_t mid[2] = { 0, 0 };
++		if (!nc_sensor_read(0x1a, 0x0016, mid, 2) || mid[0] != 0x02 || mid[1] != 0x60) {
++			printf("NOTEFE CAM: rear stream: ID %02x%02x != 0260\n", mid[0], mid[1]);
++			nc_stream_down();
++			return EIO;
++		}
++		unsigned bad = nc_imx260_write_init();
++		nc_exp = 0x300; nc_gain = 0x40;
++		nc_w = NC_REAR_W; nc_h = NC_REAR_H;
++		nc_s.mmu_ctrl = notefe_rd(nc_s.mmu0, 0);
++		nc_s.iso = notefe_rd(nc_s.pmu, 0x70c);
++		nc_s.phyc = notefe_rd(nc_s.phy0, 0x40);
++		notefe_wr(nc_s.mmu0, 0, 0);
++		notefe_wr(nc_s.pmu, 0x70c, nc_s.iso | 1u);
++		notefe_wr(nc_s.phy0, 0x40, nc_s.phyc & ~2u);
++		delay(10);
++		notefe_wr(nc_s.phy0, 0x40, nc_s.phyc | 2u);
++		for (unsigned n = 0; n < 4; n++) {
++			nc_s.rx_mux[n] = notefe_rd(nc_s.cam0, 0x220 + 4 * n);
++			nc_s.rx_gate[n] = notefe_rd(nc_s.cam0, 0x848 + 4 * n);
++			notefe_wr(nc_s.cam0, 0x220 + 4 * n, nc_s.rx_mux[n] | (1u << 12));
++			notefe_wr(nc_s.cam0, 0x848 + 4 * n, nc_s.rx_gate[n] | 1u);
++		}
++		nc_csis0_setup_4lane(nc_s.csis0, nc_o_rear_settle, nc_w, nc_h);
++		for (unsigned k = 0; k < 8; k++) {
++			notefe_wr(nc_s.csis0, 0x1010 + 4 * k, NC_BUF + (k & 3) * NC_SLOT);
++		}
++		nc_last_frm = notefe_rd(nc_s.csis0, 0x100);
++		nc_seq = 0; nc_reads = 0; nc_torn = 0;
++		nc_sensor_write(0x1a, 0x0100, 1, 8);
++		printf("NOTEFE CAM: rear stream: up, IMX260 %u x %u 4-lane, %u bad writes\n", nc_w, nc_h, bad);
++		return 0;
++	}
+ 	NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
+ 	uint32_t con = notefe_rd(pins, 0x40);
+ 	if (((con >> 16) & 0xf) != 2 || ((con >> 20) & 0xf) != 2) {
+@@ -3074,6 +3385,38 @@ nc_stream_down(void)
+ 		return;
+ 	}
+ 	vm_offset_t pins = nc_s.pins, csis = nc_s.csis;
++	if (nc_is_rear) {
++		NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
++		nc_sensor_write(0x1a, 0x0100, 0, 8);
++		delay(40000);
++		if (nc_s.csis0 && nc_s.cam0 && notefe_rd(nc_s.cam0, 0x220) != nc_s.rx_mux[0]) {
++			notefe_wr(nc_s.csis0, 0x1000, notefe_rd(nc_s.csis0, 0x1000) | 1u);
++			notefe_wr(nc_s.csis0, 0x4, notefe_rd(nc_s.csis0, 0x4) & ~1u);
++			notefe_wr(nc_s.csis0, 0x24, notefe_rd(nc_s.csis0, 0x24) & ~1u);
++			notefe_wr(nc_s.csis0, 0x4, notefe_rd(nc_s.csis0, 0x4) | 2u);
++			delay(100);
++			for (unsigned n = 0; n < 4; n++) {
++				notefe_wr(nc_s.cam0, 0x220 + 4 * n, nc_s.rx_mux[n]);
++				notefe_wr(nc_s.cam0, 0x848 + 4 * n, nc_s.rx_gate[n]);
++			}
++			notefe_wr(nc_s.phy0, 0x40, nc_s.phyc);
++			notefe_wr(nc_s.pmu, 0x70c, nc_s.iso);
++			notefe_wr(nc_s.mmu0, 0, nc_s.mmu_ctrl);
++		}
++		nc_pin(pins, 0x120, 0, 1, 0, 0);
++		nc_pin(pins, 0x180, 0, 0, -1, -1);
++		notefe_wr(nc_s.top, 0xb04, nc_s.div);
++		notefe_wr(nc_s.top, 0xb00, nc_s.mux);
++		nc_pmic_write(0x29, nc_s.rl12 & 0x7f);
++		nc_pmic_write(0x24, nc_s.rl7 & 0x7f);
++		nc_pmic_write(0x20, nc_s.rl3 & 0x7f);
++		nc_pmic_write(0x27, nc_s.rl10 & 0x7f);
++		nc_pmic_write(0x28, nc_s.rl11 & 0x7f);
++		nc_streaming = false;
++		nc_is_rear = false;
++		printf("NOTEFE CAM: rear stream: down after %llu frames (%llu torn)\n", nc_seq, nc_torn);
++		return;
++	}
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
+ 	nc_sensor_write(0x35, 0x0600, 0, 16);
+ 	delay(50000);
+@@ -3138,7 +3481,7 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	if (!nc_streaming) {
+ 		return EIO;
+ 	}
+-	vm_offset_t csis = nc_s.csis;
++	vm_offset_t csis = nc_is_rear ? nc_s.csis0 : nc_s.csis;
+ 	uint32_t f = nc_last_frm;
+ 	for (unsigned i = 0; i < 500 && f == nc_last_frm; i++) {
+ 		ns_sleep_ms(2);
+@@ -3174,10 +3517,11 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		nc_torn++;
+ 	}
+ 	struct nc_cam_frame h = { .magic = "RWFRAME", .header_bytes = sizeof(h), .width = w, .height = h_px,
+-		                  .stride = stride, .format = raw16 ? 2u : 1u, .bayer = 2, .black = 64, .sequence = nc_seq,
+-		                  .time = mach_absolute_time(), .exposure_lines = nc_exp, .line_ns = 16340, .gain = nc_gain,
+-		                  .gain_unity = 0x20, .gain_max = 0x200, .frame_lines = 2040, .frame_lines_min = 2040,
+-		                  .frame_lines_max = 2040, .margin = 4, .sensor = nc_sensor_id, .focus = 0xffffffffu,
++		                  .stride = stride, .format = raw16 ? 2u : 1u, .bayer = nc_is_rear ? 0u : 2u, .black = 64, .sequence = nc_seq,
++		                  .time = mach_absolute_time(), .exposure_lines = nc_exp, .line_ns = nc_is_rear ? 20833u : 16340u, .gain = nc_gain,
++		                  .gain_unity = 0x20, .gain_max = 0x200, .frame_lines = nc_is_rear ? 1600u : 2040u,
++		                  .frame_lines_min = nc_is_rear ? 1600u : 2040u, .frame_lines_max = nc_is_rear ? 1600u : 2040u,
++		                  .margin = 4, .sensor = nc_sensor_id, .focus = 0xffffffffu,
+ 		                  .reserved = { slot, act, f, 0, 0 } };      /* 0457: the slot read, DMA0's active pointer, FRM_CNT */
+ 	memcpy(h.magic, "RWFRAME1", 8);
+ 	int error = uiomove((caddr_t)&h, (int)MIN(sizeof(h), (size_t)uio_resid(uio)), uio);
+@@ -3233,8 +3577,13 @@ nc_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		if (error) {
+ 			return error;
+ 		}
+-		if (c.command == 3) {                          /* HAKIOS_CAMERA_SENSOR: taken, the frames carry it */
++		if (c.command == 3) {                          /* HAKIOS_CAMERA_SENSOR: switch front/rear when rear_en=1 */
++			bool want_rear = (nc_o_rear_en != 0 && c.a == 1);
+ 			nc_sensor_id = c.a;
++			if (nc_streaming && want_rear != nc_is_rear) {
++				nc_stream_down();
++				(void)nc_stream_up();
++			}
+ 		}
+ 		if (c.command == 1 && nc_streaming) {           /* HAKIOS_CAMERA_EXPOSURE */
+ 			nc_set_exposure(c.a, c.b);
+@@ -3287,7 +3636,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 9) {
++	if (value < 1 || value > 10) {
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
