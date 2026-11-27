@@ -1,0 +1,145 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index ebbbee4..7db1825 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1916,6 +1916,9 @@ nc_read(uint8_t slave, uint8_t reg, uint8_t *v, unsigned n)
+ static void notefe_cam_front_id(vm_offset_t pins);
+ static void notefe_cam_csis_look(void);
+ static void notefe_cam_frame(vm_offset_t pins);
++static void notefe_cam_rear_id(vm_offset_t pins);
++static char nc_rear_info[256] = "not probed";
++SYSCTL_STRING(_kern, OID_AUTO, notefe_cam_rear, CTLFLAG_RD | CTLFLAG_LOCKED, nc_rear_info, sizeof(nc_rear_info), "Rear camera Stage 1 probe result");
+ static void nc_dev_make(void);
+ 
+ static void
+@@ -1991,6 +1994,9 @@ notefe_cam_probe(int level)
+ 	if (level == 7) {
+ 		nc_dev_make();
+ 	}
++	if (level == 9) {
++		notefe_cam_rear_id(pins);
++	}
+ }
+ 
+ /*
+@@ -2285,6 +2291,120 @@ notefe_cam_front_id(vm_offset_t pins)
+  * the six fimc-is SysMMUs' MMU_CTRL/CFG/STATUS (0x0/0x4/0x8). CSIS2's own registers (version, control, interrupts,
+  * D-PHY, the four channels' config/resolution, frame counters, DMA0) only when its two gates read open.
+  */
++static void
++notefe_cam_rear_id(vm_offset_t pins)
++{
++	nc_pins = pins;
++	/* Ensure S2MPB02 bus (HSI2C9 on gpd1-4/5) is active */
++	uint32_t gcon = notefe_rd(pins, 0x40);
++	if (((gcon >> 16) & 0xf) != 2 || ((gcon >> 20) & 0xf) != 2) {
++		nc_pin(pins, 0x40, 4, 2, -1, -1);
++		nc_pin(pins, 0x40, 5, 2, -1, -1);
++	}
++	nc_bus_init();
++	uint8_t l3 = 0, l7 = 0, l10 = 0, l11 = 0, l12 = 0;
++	if (!nc_read(0x59, 0x20, &l3, 1) || !nc_read(0x59, 0x24, &l7, 1) ||
++	    !nc_read(0x59, 0x27, &l10, 1) || !nc_read(0x59, 0x28, &l11, 1) ||
++	    !nc_read(0x59, 0x29, &l12, 1)) {
++		snprintf(nc_rear_info, sizeof(nc_rear_info), "S2MPB02 did not answer");
++		printf("NOTEFE CAM: rear: %s\n", nc_rear_info);
++		return;
++	}
++	/* Rear sensor rails (fimc-is-module-2l1.c / fimc-is-module-imx260.c), 73C3 held in reset */
++	nc_pin(pins, 0x120, 0, 1, 0, 0);            /* gpc1-0 rear sen_rst low */
++	nc_pin(pins, 0x120, 2, 1, 0, 0);            /* gpc1-2 prep_rst low */
++	NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;    /* ISP I2C0: gpc2-0 SDA, gpc2-1 SCL */
++	nc_line(NC_SDA, 1);
++	nc_line(NC_SCL, 1);
++	nc_pmic_write(0x29, 0x80 | 0x58);           /* LDO12 VDDAF_2.8V_CAM */
++	delay(2000);
++	nc_pmic_write(0x28, 0x80 | 0x18);           /* LDO11 VDDA_2.9V_CAM -> 1.2V step */
++	delay(200);
++	nc_pmic_write(0x28, 0x80 | 0x5b);           /* LDO11 VDDA_2.9V_CAM -> 2.875V */
++	nc_pmic_write(0x27, 0x80 | 0x33);           /* LDO10 VDDA_1.8V_CAM (1.875V) */
++	nc_pmic_write(0x20, 0x80 | 0x24);           /* LDO3  VDDD_1.2V_CAM (1.05V) */
++	nc_pmic_write(0x24, 0x80 | 0x30);           /* LDO7  VDDIO_1.8V_CAM (1.80V) */
++	delay(2000);
++
++	/* MCLK0: TOP sensor clock 0 (0x10570b00) OSCCLK 26 MHz -> gpk0-0 func 2 */
++	static vm_offset_t top;
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++	}
++	uint32_t mux = notefe_rd(top, 0xb00), div = notefe_rd(top, 0xb04);
++	notefe_wr(top, 0xb00, mux & ~(7u << 12));
++	for (unsigned n = 0; n < 1000 && ((notefe_rd(top, 0xb08) >> 12) & 7) != 0; n++) {
++		delay(1);
++	}
++	notefe_wr(top, 0xb04, div & ~0xffu);
++	nc_pin(pins, 0x180, 0, 2, -1, -1);          /* gpk0-0 MCLK0 out */
++	delay(2000);
++	nc_pin(pins, 0x120, 0, 1, 0, 1);            /* gpc1-0 rear sen_rst high */
++	delay(10000);
++
++	/* Scan I2C0 (gpc2-0/1) and probe S5K2L1 (0x2d) + IMX260 (0x1a) */
++	char found0[96] = "", found1[96] = "";
++	int o0 = 0, o1 = 0;
++	NC_SDA = 0; NC_SCL = 1;
++	for (unsigned a = 0x08; a < 0x78; a++) {
++		nc_start();
++		bool ack = nc_byte_out((uint8_t)(a << 1 | 1));
++		if (ack) { (void)nc_byte_in(false); }
++		nc_stop();
++		if (ack && o0 < (int)sizeof(found0) - 8) {
++			o0 += snprintf(found0 + o0, sizeof(found0) - (size_t)o0, " %#x", a);
++		}
++	}
++	uint8_t id_2l1[2] = { 0, 0 }, rev_2l1[2] = { 0, 0 }, id_260[2] = { 0, 0 }, id_260_0[2] = { 0, 0 };
++	bool ok_2l1 = nc_sensor_read(0x2d, 0x0000, id_2l1, 2);
++	(void)nc_sensor_read(0x2d, 0x0002, rev_2l1, 2);
++	bool ok_260 = nc_sensor_read(0x1a, 0x0016, id_260, 2);
++	(void)nc_sensor_read(0x1a, 0x0000, id_260_0, 2);
++
++	/* Also test swapped SDA/SCL (1,0) if nothing answered on (0,1) */
++	if (o0 == 0) {
++		NC_SDA = 1; NC_SCL = 0;
++		for (unsigned a = 0x08; a < 0x78; a++) {
++			nc_start();
++			bool ack = nc_byte_out((uint8_t)(a << 1 | 1));
++			if (ack) { (void)nc_byte_in(false); }
++			nc_stop();
++			if (ack && o1 < (int)sizeof(found1) - 8) {
++				o1 += snprintf(found1 + o1, sizeof(found1) - (size_t)o1, " %#x", a);
++			}
++		}
++		if (o1 > 0) {
++			ok_2l1 = nc_sensor_read(0x2d, 0x0000, id_2l1, 2);
++			ok_260 = nc_sensor_read(0x1a, 0x0016, id_260, 2);
++		}
++	}
++
++	/* Read-only CSIS0 (0x14000000) & PHY reset (0x145f1050) check */
++	vm_offset_t csis0 = ml_io_map(0x14000000u, 0x2000);
++	vm_offset_t phy = ml_io_map(0x145f1000u, 0x1000);
++	uint32_t c0ver = csis0 ? notefe_rd(csis0, 0x00) : 0;
++	uint32_t phy50 = phy ? notefe_rd(phy, 0x50) : 0;
++
++	/* Power back down cleanly */
++	nc_pin(pins, 0x120, 0, 1, 0, 0);
++	nc_pin(pins, 0x180, 0, 0, -1, -1);
++	notefe_wr(top, 0xb04, div);
++	notefe_wr(top, 0xb00, mux);
++	nc_pmic_write(0x29, l12 & 0x7f);
++	nc_pmic_write(0x24, l7 & 0x7f);
++	nc_pmic_write(0x20, l3 & 0x7f);
++	nc_pmic_write(0x27, l10 & 0x7f);
++	nc_pmic_write(0x28, l11 & 0x7f);
++	NC_SDA = 2; NC_SCL = 3; /* restore front I2C1 default */
++
++	snprintf(nc_rear_info, sizeof(nc_rear_info),
++	    "i2c0(0,1):[%s] swap(1,0):[%s] 2l1=%d(%02x%02x/%02x%02x) imx260=%d(%02x%02x/%02x%02x) csis0=%#x phy=%#x",
++	    o0 ? found0 + 1 : "none", o1 ? found1 + 1 : "none",
++	    ok_2l1, id_2l1[0], id_2l1[1], rev_2l1[0], rev_2l1[1],
++	    ok_260, id_260[0], id_260[1], id_260_0[0], id_260_0[1], c0ver, phy50);
++	printf("NOTEFE CAM: rear probe: %s\n", nc_rear_info);
++}
++
+ static void
+ notefe_cam_csis_look(void)
+ {
