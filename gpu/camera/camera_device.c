@@ -1196,8 +1196,8 @@ colour_temperature(const struct isp *isp)
  * of the curve.
  */
 enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
-#define AF_NEAR         16              /* (off the stop at 0) */
-#define AF_FAR          768             /* (its module file's actuator region goes to 700; near 1023 the PM8008i's LDO5 said over-current) */
+#define AF_NEAR         0               /* AK7371 infinity end (0..511 -> 0..1023) */
+#define AF_FAR          960             /* AK7371 macro end */
 #define AF_STEP         48
 #define AF_FINE         12
 
