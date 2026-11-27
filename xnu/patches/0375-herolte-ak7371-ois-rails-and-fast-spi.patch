@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 6357694..92c2787 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2752,14 +2752,13 @@ nc_spi_deinit(vm_offset_t pins)
+ static inline void
+ nc_spi_tx_byte(vm_offset_t pins, uint32_t base_dat, uint8_t b)
+ {
++	volatile uint32_t *dat = (volatile uint32_t *)(pins + NC_SPI_BANK + 4);
+ 	for (int bit = 7; bit >= 0; bit--) {
+ 		uint32_t d = base_dat | ((b & (1u << bit)) ? NC_SPI_MOSI : 0u);
+-		notefe_wr(pins, NC_SPI_BANK + 4, d);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		notefe_wr(pins, NC_SPI_BANK + 4, d | NC_SPI_CLK);
+-		__asm__ volatile ("dsb sy" ::: "memory");
++		*dat = d;
++		*dat = d | NC_SPI_CLK;
+ 	}
+-	notefe_wr(pins, NC_SPI_BANK + 4, base_dat);
++	*dat = base_dat;
+ }
+ 
+ static inline uint8_t
+@@ -2916,6 +2915,26 @@ nc_ak7371_write8_pins(unsigned sda, unsigned scl, uint8_t reg, uint8_t val)
+ 	return ok;
+ }
+ 
++static bool
++nc_ak7371_read8_pins(unsigned sda, unsigned scl, uint8_t reg, uint8_t *out)
++{
++	uint32_t ob = NC_BANK;
++	unsigned osda = NC_SDA, oscl = NC_SCL;
++	NC_BANK = 0x140; NC_SDA = sda; NC_SCL = scl;
++	nc_start();
++	bool ok = nc_byte_out(0x18u) && nc_byte_out(reg);
++	if (ok) {
++		nc_start();
++		ok = nc_byte_out(0x19u);
++		if (ok) {
++			*out = nc_byte_in(false);
++		}
++	}
++	nc_stop();
++	NC_BANK = ob; NC_SDA = osda; NC_SCL = oscl;
++	return ok;
++}
++
+ static bool
+ nc_ak7371_set_focus(uint32_t pos10)
+ {
+@@ -2941,24 +2960,32 @@ nc_ak7371_init(void)
+ {
+ 	nc_af_ok = false;
+ 	nc_focus = 0xffffffffu;
+-	/* Release gpc2-4/5 lines high (input with board pull-up) and probe both SDA/SCL orders */
+-	uint32_t ob = NC_BANK;
+-	unsigned osda = NC_SDA, oscl = NC_SCL;
+-	NC_BANK = 0x140; NC_SDA = 4; NC_SCL = 5;
+-	nc_line(4, 1);
+-	nc_line(5, 1);
+-	NC_BANK = ob; NC_SDA = osda; NC_SCL = oscl;
+-	if (nc_ak7371_write8_pins(4, 5, 0x02u, 0x00u)) {
++	/* Release gpc2-4/5 with pull-up disabled (external 1.8V pull-up via OIS_VDD_1.8V / VDDIO_1.8V) */
++	nc_pin(nc_pins, 0x140, 4, 0, 0, -1);
++	nc_pin(nc_pins, 0x140, 5, 0, 0, -1);
++	delay(200);
++	uint32_t dat = notefe_rd(nc_pins, 0x144);
++	uint8_t pid45 = 0xff, pid54 = 0xff;
++	bool ok45 = nc_ak7371_read8_pins(4, 5, 0x03u, &pid45);
++	bool ok54 = (!ok45 || pid45 != 0x09u) ? nc_ak7371_read8_pins(5, 4, 0x03u, &pid54) : false;
++	if (ok45 && pid45 == 0x09u) {
+ 		nc_af_sda = 4; nc_af_scl = 5; nc_af_ok = true;
+-	} else if (nc_ak7371_write8_pins(5, 4, 0x02u, 0x00u)) {
++	} else if (ok54 && pid54 == 0x09u) {
+ 		nc_af_sda = 5; nc_af_scl = 4; nc_af_ok = true;
+ 	}
+ 	if (nc_af_ok) {
+-		/* Samsung AK7371_DEFAULT_FIRST_POSITION = 120 (9-bit) -> 240 (10-bit) for far/hyperfocal start */
++		/* Samsung sensor_ak7371_actuator_init(): write initial pos=120 (10-bit 240) BEFORE Active mode 0x02=0x00 */
+ 		nc_ak7371_set_focus(240u);
+-		printf("NOTEFE CAM: AK7371 AF ready on gpc2-%u/%u, pos=%u\n", nc_af_sda, nc_af_scl, nc_focus);
++		(void)nc_ak7371_write8_pins(nc_af_sda, nc_af_scl, 0x02u, 0x00u);
++		delay(5000);
++		uint8_t rb0 = 0, rb2 = 0;
++		(void)nc_ak7371_read8_pins(nc_af_sda, nc_af_scl, 0x00u, &rb0);
++		(void)nc_ak7371_read8_pins(nc_af_sda, nc_af_scl, 0x02u, &rb2);
++		printf("NOTEFE CAM: AK7371 AF ready on gpc2-%u/%u (pid=0x09, dat=%#x, r0=%#x, r2=%#x)\n",
++		    nc_af_sda, nc_af_scl, dat, rb0, rb2);
+ 	} else {
+-		printf("NOTEFE CAM: AK7371 AF did not answer on gpc2-4/5\n");
++		printf("NOTEFE CAM: AK7371 AF not found (gpc2 dat=%#x, 4/5=%d:%#x, 5/4=%d:%#x)\n",
++		    dat, ok45, pid45, ok54, pid54);
+ 	}
+ }
+ 
+@@ -3534,7 +3561,7 @@ static struct {
+ 	vm_offset_t top, csis, phy, pmu, mmu, cam1, pins;
+ 	vm_offset_t csis0, phy0, mmu0, cam0;
+ 	uint8_t l5, l6, l7, l13;
+-	uint8_t rl3, rl7, rl10, rl11, rl12;
++	uint8_t rl3, rl7, rl10, rl11, rl12, rl14, rl15, rl17;
+ 	uint8_t cl1, cl2, cl4, cl8, cl9, cb2[2];
+ 	uint32_t mux1, div1;
+ 	vm_offset_t cam0_loc;
+@@ -3618,15 +3645,21 @@ nc_stream_up(void)
+ 			printf("NOTEFE CAM: rear stream: S2MPB02 fail\n");
+ 			return EIO;
+ 		}
++		nc_read(0x59, 0x2b, &nc_s.rl14, 1);
++		nc_read(0x59, 0x2c, &nc_s.rl15, 1);
++		nc_read(0x59, 0x2e, &nc_s.rl17, 1);
+ 		nc_pin(pins, 0x120, 0, 1, 0, 0);
+ 		nc_pin(pins, 0x120, 2, 1, 0, 0);
+ 		nc_line(NC_SDA, 1);
+ 		nc_line(NC_SCL, 1);
+-		nc_pmic_write(0x29, 0x80 | 0x58);
++		nc_pmic_write(0x29, 0x80 | 0x58); /* LDO12 VDDAF_2.8V_CAM */
+ 		delay(2000);
+ 		nc_pmic_write(0x28, 0x80 | 0x18);
+ 		delay(200);
+ 		nc_pmic_write(0x28, 0x80 | 0x5b);
++		nc_pmic_write(0x2e, 0x80 | 0x30); /* LDO17 OIS_VDD_1.8V (I2C2 pull-ups & OIS logic) */
++		nc_pmic_write(0x2c, 0x80 | 0x58); /* LDO15 OIS_VDD_2.8V */
++		nc_pmic_write(0x2b, 0x80 | 0x58); /* LDO14 OIS_VM_2.8V */
+ 		nc_pmic_write(0x27, 0x80 | 0x33);
+ 		nc_pmic_write(0x20, 0x80 | 0x24);
+ 		nc_pmic_write(0x24, 0x80 | 0x30);
+@@ -3841,6 +3874,9 @@ nc_stream_down(void)
+ 		nc_pmic_write(0x20, nc_s.rl3 & 0x7f);
+ 		nc_pmic_write(0x27, nc_s.rl10 & 0x7f);
+ 		nc_pmic_write(0x28, nc_s.rl11 & 0x7f);
++		nc_pmic_write(0x2c, nc_s.rl15 & 0x7f);
++		nc_pmic_write(0x2b, nc_s.rl14 & 0x7f);
++		nc_pmic_write(0x2e, nc_s.rl17 & 0x7f);
+ 		nc_pin(pins, 0x120, 2, 1, 0, 0);
+ 		nc_pin(pins, 0x180, 1, 0, -1, -1);
+ 		notefe_wr(nc_s.top, 0xb14, nc_s.div1);
