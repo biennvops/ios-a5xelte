@@ -1043,7 +1043,8 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	bool is_still = strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA;
+	struct render_job job = { isp, f, raw, pb, pf, width, height, is_still ? 8 : 6, is_still };
 	uint64_t began = mach_absolute_time();
 
 	uint32_t cw = 0, ch = 0;
@@ -1440,6 +1441,70 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	}
 }
 
+struct cam_pipe {
+	int             device;
+	size_t          bytes;
+	uint8_t        *buf[3];
+	pthread_mutex_t lock;
+	pthread_cond_t  cond;
+	int             ready_idx;
+	int             busy_idx;
+	bool            stop;
+	bool            fault;
+};
+
+static void *
+cam_reader(void *arg)
+{
+	struct cam_pipe *cp = arg;
+	int failures = 0;
+
+	pthread_setname_np("hakios-cam-read");
+	for (;;) {
+		pthread_mutex_lock(&cp->lock);
+		if (cp->stop) {
+			pthread_mutex_unlock(&cp->lock);
+			break;
+		}
+		int w = -1;
+		for (int i = 0; i < 3; i++) {
+			if (i != cp->busy_idx && i != cp->ready_idx) {
+				w = i;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&cp->lock);
+		if (w < 0) {
+			usleep(1000);
+			continue;
+		}
+		ssize_t n = read(cp->device, cp->buf[w], cp->bytes);
+		if (n != (ssize_t)cp->bytes) {
+			if (n < 0 && errno == EIO) {
+				pthread_mutex_lock(&cp->lock);
+				cp->fault = true;
+				pthread_cond_signal(&cp->cond);
+				pthread_mutex_unlock(&cp->lock);
+				break;
+			}
+			if (n < 0 && errno != EAGAIN && ++failures >= 5) {
+				pthread_mutex_lock(&cp->lock);
+				cp->fault = true;
+				pthread_cond_signal(&cp->cond);
+				pthread_mutex_unlock(&cp->lock);
+				break;
+			}
+			continue;
+		}
+		failures = 0;
+		pthread_mutex_lock(&cp->lock);
+		cp->ready_idx = w;
+		pthread_cond_signal(&cp->cond);
+		pthread_mutex_unlock(&cp->lock);
+	}
+	return NULL;
+}
+
 static void *
 worker(void *context)
 {
@@ -1448,6 +1513,9 @@ worker(void *context)
 	struct hakios_camera_frame head;
 	struct isp isp;
 	struct isp_stats st;
+	struct cam_pipe pipe = { .device = -1, .ready_idx = -1, .busy_idx = -1 };
+	pthread_t rthread;
+	bool reader_up = false;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
 	uint32_t tuned_for = ~0u;
@@ -1461,12 +1529,14 @@ worker(void *context)
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
 		return NULL;
 	}
+	pthread_mutex_init(&pipe.lock, NULL);
+	pthread_cond_init(&pipe.cond, NULL);
 	load_cam_cfg();
 	isp_init(&isp);
 	while (s->running && failures < 5) {
 		ssize_t n;
 
-		if (buffer == NULL) {
+		if (!reader_up) {
 			n = read(device, &head, sizeof(head));
 			if (n != (ssize_t)sizeof(head)) {
 				failures += n < 0 && errno == EAGAIN ? 0 : 1;
@@ -1488,21 +1558,45 @@ worker(void *context)
 				continue;
 			}
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
-			buffer = malloc(bytes);
-			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
+			pipe.device = device;
+			pipe.bytes = bytes;
+			for (int i = 0; i < 3; i++) {
+				pipe.buf[i] = malloc(bytes);
+			}
+			if (!pipe.buf[0] || !pipe.buf[1] || !pipe.buf[2] ||
+			    pthread_create(&rthread, NULL, cam_reader, &pipe) != 0) {
+				say("failed to start async camera reader");
+				break;
+			}
+			reader_up = true;
+			say("frames of %ux%u from the kernel (the %s, async 3-buf)", head.width, head.height, s->camera->name);
 			continue;
 		}
 		uint64_t t_read = mach_absolute_time();
-		n = read(device, buffer, bytes);
-		uint64_t t_got = mach_absolute_time();
-		if (n != (ssize_t)bytes) {
-			if (n < 0 && errno == EIO) {
+		pthread_mutex_lock(&pipe.lock);
+		while (pipe.ready_idx < 0 && !pipe.fault && s->running) {
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += 50000000;
+			if (ts.tv_nsec >= 1000000000) {
+				ts.tv_sec += 1;
+				ts.tv_nsec -= 1000000000;
+			}
+			pthread_cond_timedwait(&pipe.cond, &pipe.lock, &ts);
+		}
+		if (pipe.fault || !s->running || pipe.ready_idx < 0) {
+			pthread_mutex_unlock(&pipe.lock);
+			if (pipe.fault) {
 				say("the kernel's camera has had a fault: no more frames");
 				break;
 			}
-			failures += n < 0 && errno == EAGAIN ? 0 : 1;
 			continue;
 		}
+		pipe.busy_idx = pipe.ready_idx;
+		pipe.ready_idx = -1;
+		buffer = pipe.buf[pipe.busy_idx];
+		pthread_mutex_unlock(&pipe.lock);
+		uint64_t t_got = mach_absolute_time();
 		failures = 0;
 
 		struct hakios_camera_frame *f_mut = (void *)buffer;
@@ -1636,8 +1730,21 @@ worker(void *context)
 			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
 			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
 		}
+		pthread_mutex_lock(&pipe.lock);
+		pipe.busy_idx = -1;
+		pthread_mutex_unlock(&pipe.lock);
 	}
-	free(buffer);
+	if (reader_up) {
+		pthread_mutex_lock(&pipe.lock);
+		pipe.stop = true;
+		pthread_mutex_unlock(&pipe.lock);
+		pthread_join(rthread, NULL);
+	}
+	for (int i = 0; i < 3; i++) {
+		free(pipe.buf[i]);
+	}
+	pthread_cond_destroy(&pipe.cond);
+	pthread_mutex_destroy(&pipe.lock);
 	close(device);
 	say("the frames stopped (%llu)", s->frames);
 	return NULL;

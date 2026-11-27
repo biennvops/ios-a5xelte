@@ -645,36 +645,40 @@ isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, cons
 				const uint16_t *t0 = (const uint16_t *)raw + (size_t)cy * 2u * stride_u16;
 				const uint16_t *t1 = t0 + stride_u16;
 				uint8_t *dst = line[k];
+				uint32_t prev_sx = ~0u;
+				uint8_t pr = 0, pg = 0, pb = 0;
 				for (uint32_t x = 0; x < width; x++) {
 					uint32_t sx = cx_lut[x];
-					int v[4];
-					v[0] = (int)(t0[sx] & 0x3ffu) - black;
-					v[1] = (int)(t0[sx + 1] & 0x3ffu) - black;
-					v[2] = (int)(t1[sx] & 0x3ffu) - black;
-					v[3] = (int)(t1[sx + 1] & 0x3ffu) - black;
-					if (v[0] < 0) v[0] = 0;
-					if (v[1] < 0) v[1] = 0;
-					if (v[2] < 0) v[2] = 0;
-					if (v[3] < 0) v[3] = 0;
-					int rv = v[r_idx], gv = (v[g0_idx] + v[g1_idx]) >> 1, bv = v[b_idx];
-					int mx = rv > gv ? (rv > bv ? rv : bv) : (gv > bv ? gv : bv);
-					if (__builtin_expect(mx > 820, 0)) {
-						int t_q8 = ((mx - 820) * 256) / (959 - 820);
-						if (t_q8 > 256) t_q8 = 256;
-						int wv = gv > (mx * 7) / 10 ? gv : mx;
-						int rw = (wv * wb_r_q10) >> 10;
-						int bw = (wv * wb_b_q10) >> 10;
-						rv += ((rw - rv) * t_q8) >> 8;
-						bv += ((bw - bv) * t_q8) >> 8;
-						gv += ((wv - gv) * t_q8) >> 8;
+					if (sx != prev_sx) {
+						prev_sx = sx;
+						int v0 = (int)(t0[sx] & 0x3ffu) - black;
+						int v1 = (int)(t0[sx + 1] & 0x3ffu) - black;
+						int v2 = (int)(t1[sx] & 0x3ffu) - black;
+						int v3 = (int)(t1[sx + 1] & 0x3ffu) - black;
+						int v[4] = { v0 < 0 ? 0 : v0, v1 < 0 ? 0 : v1, v2 < 0 ? 0 : v2, v3 < 0 ? 0 : v3 };
+						int rv = v[r_idx], gv = (v[g0_idx] + v[g1_idx]) >> 1, bv = v[b_idx];
+						int mx = rv > gv ? (rv > bv ? rv : bv) : (gv > bv ? gv : bv);
+						if (__builtin_expect(mx > 820, 0)) {
+							int t_q8 = ((mx - 820) * 256) / (959 - 820);
+							if (t_q8 > 256) t_q8 = 256;
+							int wv = gv > (mx * 7) / 10 ? gv : mx;
+							int rw = (wv * wb_r_q10) >> 10;
+							int bw = (wv * wb_b_q10) >> 10;
+							rv += ((rw - rv) * t_q8) >> 8;
+							bv += ((bw - bv) * t_q8) >> 8;
+							gv += ((wv - gv) * t_q8) >> 8;
+						}
+						int o0 = (im[0][0] * rv + im[0][1] * gv + im[0][2] * bv + 512) >> 10;
+						int o1 = (im[1][0] * rv + im[1][1] * gv + im[1][2] * bv + 512) >> 10;
+						int o2 = (im[2][0] * rv + im[2][1] * gv + im[2][2] * bv + 512) >> 10;
+						pr = gamma[o0 < 0 ? 0 : o0 > 4095 ? 4095 : o0];
+						pg = gamma[o1 < 0 ? 0 : o1 > 4095 ? 4095 : o1];
+						pb = gamma[o2 < 0 ? 0 : o2 > 4095 ? 4095 : o2];
 					}
-					int o0 = (im[0][0] * rv + im[0][1] * gv + im[0][2] * bv + 512) >> 10;
-					int o1 = (im[1][0] * rv + im[1][1] * gv + im[1][2] * bv + 512) >> 10;
-					int o2 = (im[2][0] * rv + im[2][1] * gv + im[2][2] * bv + 512) >> 10;
 					uint8_t *px = dst + 3u * (turned ? (width - 1 - x) : x);
-					px[0] = gamma[o0 < 0 ? 0 : o0 > 4095 ? 4095 : o0];
-					px[1] = gamma[o1 < 0 ? 0 : o1 > 4095 ? 4095 : o1];
-					px[2] = gamma[o2 < 0 ? 0 : o2 > 4095 ? 4095 : o2];
+					px[0] = pr;
+					px[1] = pg;
+					px[2] = pb;
 				}
 			}
 			nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
