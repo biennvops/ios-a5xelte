@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index fc31405..53e9a10 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1919,7 +1919,7 @@ static void notefe_cam_frame(vm_offset_t pins);
+ static void notefe_cam_rear_id(vm_offset_t pins);
+ static void notefe_cam_rear_frame(vm_offset_t pins);
+ static uint32_t nc_o_rear_en = 0, nc_o_rear_settle = 30, nc_o_rear_flip = 0, nc_o_rear_comp = 1;
+-static uint32_t nc_o_rear_bypass = 0, nc_o_rear_c3idx = 7;
++static uint32_t nc_o_rear_bypass = 0, nc_o_rear_c3idx = 7, nc_o_rear_swap = 0;
+ static uint8_t *nc_c3_fw_buf;
+ static uint32_t nc_c3_fw_len;
+ static int
+@@ -1957,6 +1957,7 @@ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam_c3fw, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+     NULL, 0, notefe_cam_c3fw_sysctl, "S", "Rear 73C3 companion firmware binary (root writes it)");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_bypass, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_bypass, 0, "73C3 api_debug_out=0x99 bypass (0/1)");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_c3idx, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_c3idx, 0, "73C3 api_config_idx (default 7 = 2016x1512)");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_swap, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_swap, 0, "IMX260 MIPI lane map: 0=Samsung(02,01,03,00), 1=linear(00,01,02,03), 2=default");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_en, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_en, 0, "Enable live rear IMX260 camera switching in /dev/hakios-camera");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_settle, 0, "Rear IMX260 CSIS0 HS settle");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_rear_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_rear_flip, 0, "Rear IMX260 0x0101 flip (0..3)");
+@@ -2906,6 +2907,20 @@ nc_imx260_write_init(void)
+ 	for (unsigned i = 0; i < sizeof(nc_imx260_2016) / sizeof(nc_imx260_2016[0]); i++) {
+ 		bad += !nc_sensor_write(0x1a, nc_imx260_2016[i].reg, nc_imx260_2016[i].val, 8);
+ 	}
++	if (nc_o_rear_swap == 0) {
++		/* Samsung fimc-is-cis-imx260.c physical PCB MIPI lane mapping */
++		bad += !nc_sensor_write(0x1a, 0x40ad, 0x00, 8);
++		bad += !nc_sensor_write(0x1a, 0x40b8, 0x02, 8);
++		bad += !nc_sensor_write(0x1a, 0x40b9, 0x01, 8);
++		bad += !nc_sensor_write(0x1a, 0x40ba, 0x03, 8);
++		bad += !nc_sensor_write(0x1a, 0x40bb, 0x00, 8);
++	} else if (nc_o_rear_swap == 1) {
++		bad += !nc_sensor_write(0x1a, 0x40ad, 0x00, 8);
++		bad += !nc_sensor_write(0x1a, 0x40b8, 0x00, 8);
++		bad += !nc_sensor_write(0x1a, 0x40b9, 0x01, 8);
++		bad += !nc_sensor_write(0x1a, 0x40ba, 0x02, 8);
++		bad += !nc_sensor_write(0x1a, 0x40bb, 0x03, 8);
++	}
+ 	bad += !nc_sensor_write(0x1a, 0x0101, (uint16_t)(nc_o_rear_flip & 3u), 8);
+ 	bad += !nc_sensor_write(0x1a, 0x0202, 0x0300, 16);
+ 	bad += !nc_sensor_write(0x1a, 0x0204, 0x0100, 16);
+@@ -3042,19 +3057,22 @@ notefe_cam_rear_frame(vm_offset_t pins)
+ 	bad += !nc_sensor_write(0x1a, 0x0100, 0x01, 8);
+ 	bad += !nc_sensor_write(0x1a, 0x0104, 0x00, 8);
+ 	ns_sleep_ms(600);
+-	uint8_t sfc = 0, smode = 0;
++	uint8_t sfc = 0, smode = 0, srev = 0;
+ 	(void)nc_sensor_read(0x1a, 0x0005, &sfc, 1);
+ 	(void)nc_sensor_read(0x1a, 0x0100, &smode, 1);
+-	uint16_t c3_fc = 0, c3_ow = 0, c3_oh = 0, c3_fe = 0, c3_fi = 0, c3_ec = 0, c3_c0 = 0;
++	(void)nc_sensor_read(0x1a, 0x0018, &srev, 1);
++	uint16_t c3_fc = 0, c3_ow = 0, c3_oh = 0, c3_fe = 0, c3_ec = 0, c3_c0 = 0, c3_c1 = 0, c3_c2 = 0, c3_c3 = 0;
+ 	if (nc_o_rear_comp && c3_fw) {
+ 		nc_sensor_write(0x3d, 0xfcfc, 0x2000, 16);
+ 		c3_fc = nc_c3_i2c_read16(0x0052);
+ 		c3_ow = nc_c3_i2c_read16(0x00cc);
+ 		c3_oh = nc_c3_i2c_read16(0x00ce);
+ 		c3_fe = nc_c3_i2c_read16(0x0ff6);
+-		c3_fi = nc_c3_i2c_read16(0x0ff8);
+ 		c3_ec = nc_c3_i2c_read16(0x0ffe);
+ 		c3_c0 = nc_c3_i2c_read16(0x0fd0);
++		c3_c1 = nc_c3_i2c_read16(0x0fd2);
++		c3_c2 = nc_c3_i2c_read16(0x0fd4);
++		c3_c3 = nc_c3_i2c_read16(0x0fd6);
+ 		nc_c3_stream_off();
+ 	}
+ 	uint32_t f1 = notefe_rd(csis0, 0x100);
+@@ -3105,8 +3123,8 @@ notefe_cam_rear_frame(vm_offset_t pins)
+ 	NC_SDA = 2; NC_SCL = 3;
+ 
+ 	snprintf(nc_rear_info, sizeof(nc_rear_info),
+-	    "c3(v=%#x in=%#x fc=%u %ux%u err=%#x/%#x#%u c0=%u) sfc=%u csis0=%u->%u dphy=%#x irq=%#x/%#x chg=%u",
+-	    c3_ver, c3_init, c3_fc, c3_ow, c3_oh, c3_fe, c3_fi, c3_ec, c3_c0, sfc, f0, f1, dphy, irq0, irq1, changed);
++	    "rev=%#x sw=%u c3(fc=%u %ux%u e=%#x#%u c=%u/%u/%u/%u) sfc=%u csis0=%u->%u dphy=%#x chg=%u",
++	    srev, nc_o_rear_swap, c3_fc, c3_ow, c3_oh, c3_fe, c3_ec, c3_c0, c3_c1, c3_c2, c3_c3, sfc, f0, f1, dphy, changed);
+ 	printf("NOTEFE CAM: rear frame: %s\n", nc_rear_info);
+ }
+ 
