@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
-index b13ea9c..bce9bd9 100644
+index b13ea9c..91f0bd9 100644
 --- a/bsd/dev/herolte_gl.c
 +++ b/bsd/dev/herolte_gl.c
 @@ -2394,11 +2394,15 @@ extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
@@ -31,7 +31,15 @@ index b13ea9c..bce9bd9 100644
  		bad += !nc_sensor_write(0x35, 0x034c, 1304, 16);
  		bad += !nc_sensor_write(0x35, 0x034e, 980, 16);
  	} else if (mode == 2) { /* SMIA crop: x 664-1943, y 620-1339, output 1280 x 720 */
-@@ -2889,8 +2895,11 @@ nc_stream_up(void)
+@@ -2830,6 +2836,7 @@ nc_set_exposure(uint32_t lines, uint32_t gain)
+ 	nc_sensor_write(0x35, 0x0104, 1, 8);
+ 	nc_sensor_write(0x35, 0x0202, (uint16_t)nc_exp, 16);
+ 	nc_sensor_write(0x35, 0x0204, (uint16_t)nc_gain, 16);
++	nc_sensor_write(0x35, 0x0220, (uint16_t)nc_gain, 16); /* S5K4E6 R/B analog gain (paired with 0x0204 G gain) */
+ 	nc_sensor_write(0x35, 0x0104, 0, 8);
+ }
+ 
+@@ -2889,8 +2896,11 @@ nc_stream_up(void)
  	}
  	bad += !nc_sensor_write(0x35, 0x0900, 0x01, 8);
  	bad += !nc_sensor_write(0x35, 0x0901, 0x22, 8);
@@ -43,7 +51,7 @@ index b13ea9c..bce9bd9 100644
  	if (nc_o_tp) {
  		nc_sensor_write(0x35, 0x0600, (uint16_t)nc_o_tp, 16);
  	}
-@@ -3033,7 +3042,7 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -3033,7 +3043,7 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
  		nc_torn++;
  	}
  	struct nc_cam_frame h = { .magic = "RWFRAME", .header_bytes = sizeof(h), .width = NC_SW, .height = NC_SH,
