@@ -1070,9 +1070,9 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	} else {
 		dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
 	}
-	if (pf != PF_BGRA) {
+	if (job.still && pf != PF_BGRA) {
 		isp_sharpen_y(CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-		    width, height, job.still ? 14 : 10);
+		    width, height, 14);
 	}
 	if (job.still) {
 		static mach_timebase_info_data_t tb;

@@ -49,15 +49,26 @@ cell_places(uint32_t bayer, int *r, int *b)
 
 /* the four values of the cell at cx of the pair of lines from `top' (above black, 0 and up) */
 static inline void
-cell(const uint8_t *top, size_t stride, uint32_t cx, int v[4])
+cell(const struct hakios_camera_frame *f, const uint8_t *top, uint32_t cx, int v[4])
 {
-	const uint8_t *g0 = top + (size_t)(cx >> 1) * 5, *g1 = g0 + stride;
-	unsigned o = (cx & 1) * 2;
+	int black = (int)f->black;
+	if (f->format == 2) {
+		/* Native 16-bit LE RAW10 (from Exynos CSIS2 DMA0 without CPU bit-packing). */
+		const uint16_t *r0 = (const uint16_t *)top + (size_t)cx * 2;
+		const uint16_t *r1 = (const uint16_t *)(top + f->stride) + (size_t)cx * 2;
+		v[0] = (int)(r0[0] & 0x3ffu) - black;
+		v[1] = (int)(r0[1] & 0x3ffu) - black;
+		v[2] = (int)(r1[0] & 0x3ffu) - black;
+		v[3] = (int)(r1[1] & 0x3ffu) - black;
+	} else {
+		const uint8_t *g0 = top + (size_t)(cx >> 1) * 5, *g1 = g0 + f->stride;
+		unsigned o = (cx & 1) * 2;
 
-	v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - 64;
-	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - 64;
-	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - 64;
-	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - 64;
+		v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - black;
+		v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - black;
+		v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - black;
+		v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - black;
+	}
 	for (int i = 0; i < 4; i++) {
 		v[i] = v[i] < 0 ? 0 : v[i];
 	}
@@ -96,7 +107,7 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 				for (uint32_t cx = cx0 + bx * BLOCK; cx < cx0 + bx * BLOCK + BLOCK; cx++) {
 					int v[4];
 
-					cell(top, f->stride, cx, v);
+					cell(f, top, cx, v);
 					for (int i = 0; i < 4; i++) {
 						g += i != r && i != b ? (uint32_t)v[i] : 0;
 					}
@@ -142,7 +153,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		for (uint32_t cx = 0; cx < cells_w; cx += step) {
 			int v[4], g = 0, top_v = 0;
 
-			cell(top, f->stride, cx, v);
+			cell(f, top, cx, v);
 			for (int i = 0; i < 4; i++) {
 				g += i != r && i != b ? v[i] : 0;
 				top_v = v[i] > top_v ? v[i] : top_v;
@@ -507,7 +518,7 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 				int v[4];
 				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
 
-				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, v);
+				cell(f, k & 2 ? t1 : t0, k & 1 ? cx1 : cx0, v);
 				c[0] += w * v[r];
 				c[2] += w * v[b];
 				for (int j = 0; j < 4; j++) {
@@ -530,7 +541,7 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		uint32_t cx = (uint32_t)(at >> 16);
 		int v[4], g = 0;
 
-		cell(top, f->stride, cx, v);
+		cell(f, top, cx, v);
 		for (int j = 0; j < 4; j++) {
 			g += j != r && j != b ? v[j] : 0;
 		}
@@ -643,12 +654,21 @@ unpack_line(const struct hakios_camera_frame *f, const uint8_t *raw, int y, int 
 {
 	y = y < 0 ? 0 : y >= (int)f->height ? (int)f->height - 1 : y;
 	const uint8_t *line = raw + (size_t)y * f->stride;
+	int black = (int)f->black;
 
+	if (f->format == 2) {
+		const uint16_t *src = (const uint16_t *)line;
+		for (uint32_t x = 0; x < f->width; x++) {
+			int v = (int)(src[x] & 0x3ffu) - black;
+			out[x] = v < 0 ? 0 : v;
+		}
+		return;
+	}
 	for (uint32_t x = 0; x + 3 < f->width + 3 && x < f->width; x += 4) {
 		const uint8_t *g = line + (x >> 2) * 5;
 
 		for (int i = 0; i < 4 && x + i < f->width; i++) {
-			int v = (g[i] << 2 | (g[4] >> (i * 2) & 3)) - (int)f->black;
+			int v = (g[i] << 2 | (g[4] >> (i * 2) & 3)) - black;
 
 			out[x + i] = v < 0 ? 0 : v;
 		}
@@ -856,7 +876,7 @@ isp_lsc_from_flat(struct isp *isp, const struct hakios_camera_frame *f, const ui
 					if (cx < 0 || cy < 0 || cx >= (int)cells_w || cy >= (int)cells_h) {
 						continue;
 					}
-					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, v);
+					cell(f, raw + (size_t)cy * 2 * f->stride, (uint32_t)cx, v);
 					sum[0] += v[r];
 					sum[2] += v[b];
 					for (int j = 0; j < 4; j++) {
