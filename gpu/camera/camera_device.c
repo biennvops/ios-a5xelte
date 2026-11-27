@@ -1379,6 +1379,35 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	}
 }
 
+static int cam_cfg_bayer = 2;   /* S5K4E6 with 0x0101=3 flips native GRBG(1) -> GBRG(2); overridable via cam.cfg */
+static int cam_cfg_turned = -1; /* -1 = use camera->turned, 0/1 = override */
+static float cam_cfg_sat = 1.0f;
+
+static void
+load_cam_cfg(void)
+{
+	cam_cfg_bayer = 2;
+	cam_cfg_turned = -1;
+	cam_cfg_sat = 1.0f;
+	FILE *f = fopen("/private/var/herolte/cam.cfg", "r");
+	if (f == NULL) {
+		return;
+	}
+	char line[128];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		int iv;
+		float fv;
+		if (sscanf(line, "bayer=%d", &iv) == 1 && iv >= -1 && iv <= 3) {
+			cam_cfg_bayer = iv;
+		} else if (sscanf(line, "turned=%d", &iv) == 1 && iv >= -1 && iv <= 1) {
+			cam_cfg_turned = iv;
+		} else if (sscanf(line, "sat=%f", &fv) == 1 && fv >= 0.0f && fv <= 2.0f) {
+			cam_cfg_sat = fv;
+		}
+	}
+	fclose(f);
+}
+
 /* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/camtuning.py) */
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
@@ -1394,8 +1423,15 @@ load_tuning(struct isp *isp, uint32_t sensor)
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
 	} else {
-		say("no colour tuning for the %s (%s): no colour matrix, no lens shading", names[sensor], path);
-		isp_set_ccm(isp, (const float[9]){ 1, 0, 0, 0, 1, 0, 0, 0, 1 });
+		float a = cam_cfg_sat;
+		float ccm[9] = {
+			1.0f + 0.75f * a, -0.60f * a,       -0.15f * a,
+			-0.25f * a,        1.0f + 0.55f * a, -0.30f * a,
+			-0.05f * a,       -0.55f * a,        1.0f + 0.60f * a,
+		};
+		say("using default sRGB CCM (sat=%.2f, bayer=%d, turned=%d) for %s",
+		    a, cam_cfg_bayer, cam_cfg_turned, names[sensor]);
+		isp_set_ccm(isp, ccm);
 		isp->lsc.on = false;
 	}
 }
@@ -1421,6 +1457,7 @@ worker(void *context)
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
 		return NULL;
 	}
+	load_cam_cfg();
 	isp_init(&isp);
 	while (s->running && failures < 5) {
 		ssize_t n;
@@ -1464,7 +1501,11 @@ worker(void *context)
 		}
 		failures = 0;
 
-		const struct hakios_camera_frame *f = (const void *)buffer;
+		struct hakios_camera_frame *f_mut = (void *)buffer;
+		if (cam_cfg_bayer >= 0) {
+			f_mut->bayer = (uint32_t)cam_cfg_bayer;
+		}
+		const struct hakios_camera_frame *f = f_mut;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct hakios_camera_command c;
 
@@ -1482,7 +1523,7 @@ worker(void *context)
 		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
 		isp_tune(&isp, lux, cct);
 		isp.zoom = s->zoom;
-		isp.turned = s->camera->turned;
+		isp.turned = cam_cfg_turned >= 0 ? (cam_cfg_turned != 0) : s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}

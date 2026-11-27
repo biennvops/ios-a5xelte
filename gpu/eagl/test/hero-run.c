@@ -20,11 +20,14 @@ extern void *objc_autoreleasePoolPush(void);
 extern void objc_autoreleasePoolPop(void *pool);
 extern void NSSetUncaughtExceptionHandler(void (*handler)(id));
 #include <objc/runtime.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1216,6 +1219,219 @@ haptics_probe(__unused void *unused)
    return NULL;
 }
 
+/*
+ * Lightweight root debug server on TCP :2222 (LAN/USB) for live file push/pull,
+ * process restarts, sysctl reads/writes and command execution without rebooting to TWRP.
+ */
+static ssize_t
+dbg_read_line(int fd, char *buf, size_t max)
+{
+   size_t n = 0;
+   while (n + 1 < max) {
+      char c;
+      ssize_t r = read(fd, &c, 1);
+      if (r <= 0)
+         return n ? (ssize_t)n : r;
+      if (c == '\r')
+         continue;
+      if (c == '\n')
+         break;
+      buf[n++] = c;
+   }
+   buf[n] = 0;
+   return (ssize_t)n;
+}
+
+static bool
+dbg_write_all(int fd, const void *buf, size_t len)
+{
+   const uint8_t *p = (const uint8_t *)buf;
+   while (len > 0) {
+      ssize_t w = write(fd, p, len);
+      if (w <= 0)
+         return false;
+      p += w;
+      len -= (size_t)w;
+   }
+   return true;
+}
+
+static void
+dbg_handle_client(int cfd)
+{
+   char line[1024];
+   ssize_t n = dbg_read_line(cfd, line, sizeof(line));
+   if (n <= 0) {
+      close(cfd);
+      return;
+   }
+   if (strcmp(line, "ping") == 0) {
+      dprintf(cfd, "pong\n");
+   } else if (strncmp(line, "ls ", 3) == 0) {
+      DIR *d = opendir(line + 3);
+      if (!d) {
+         dprintf(cfd, "ERR opendir %s: %d\n", line + 3, errno);
+      } else {
+         struct dirent *de;
+         while ((de = readdir(d)) != NULL) {
+            char full[1024];
+            struct stat st;
+            snprintf(full, sizeof(full), "%s/%s", line + 3, de->d_name);
+            if (lstat(full, &st) == 0)
+               dprintf(cfd, "%o %lld %s\n", (unsigned)(st.st_mode & 07777), (long long)st.st_size, de->d_name);
+            else
+               dprintf(cfd, "0 0 %s\n", de->d_name);
+         }
+         closedir(d);
+      }
+   } else if (strncmp(line, "get ", 4) == 0) {
+      int f = open(line + 4, O_RDONLY);
+      struct stat st;
+      if (f < 0 || fstat(f, &st) != 0) {
+         dprintf(cfd, "ERR open %s: %d\n", line + 4, errno);
+         if (f >= 0) close(f);
+      } else {
+         dprintf(cfd, "OK %lld\n", (long long)st.st_size);
+         char buf[16384];
+         ssize_t r;
+         while ((r = read(f, buf, sizeof(buf))) > 0) {
+            if (!dbg_write_all(cfd, buf, (size_t)r))
+               break;
+         }
+         close(f);
+      }
+   } else if (strncmp(line, "put ", 4) == 0) {
+      unsigned long long sz = 0;
+      unsigned mode = 0644;
+      char path[768] = "";
+      if (sscanf(line + 4, "%llu %o %767s", &sz, &mode, path) != 3 || sz > (64ull << 20)) {
+         dprintf(cfd, "ERR syntax: put SIZE MODE_OCT PATH\n");
+      } else {
+         char tmp[800];
+         snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+         int f = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+         if (f < 0) {
+            dprintf(cfd, "ERR open %s: %d\n", tmp, errno);
+         } else {
+            char buf[16384];
+            unsigned long long left = sz;
+            bool ok = true;
+            while (left > 0) {
+               size_t want = left > sizeof(buf) ? sizeof(buf) : (size_t)left;
+               ssize_t r = read(cfd, buf, want);
+               if (r <= 0 || !dbg_write_all(f, buf, (size_t)r)) {
+                  ok = false;
+                  break;
+               }
+               left -= (unsigned long long)r;
+            }
+            close(f);
+            if (ok) {
+               chmod(tmp, mode);
+               if (rename(tmp, path) == 0)
+                  dprintf(cfd, "OK %llu %s\n", sz, path);
+               else
+                  dprintf(cfd, "ERR rename: %d\n", errno);
+            } else {
+               unlink(tmp);
+               dprintf(cfd, "ERR short read\n");
+            }
+         }
+      }
+   } else if (strncmp(line, "rm ", 3) == 0) {
+      int r = unlink(line + 3);
+      dprintf(cfd, "%s %d\n", r == 0 ? "OK" : "ERR", r == 0 ? 0 : errno);
+   } else if (strncmp(line, "kill ", 5) == 0) {
+      int cnt = kill_by_name(line + 5, SIGKILL);
+      dprintf(cfd, "OK killed %d\n", cnt);
+   } else if (strcmp(line, "ps") == 0) {
+      int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+      size_t sz = 0;
+      if (sysctl(mib, 4, NULL, &sz, NULL, 0) == 0 && sz > 0) {
+         struct kinfo_proc *kp = malloc(sz);
+         if (kp && sysctl(mib, 4, kp, &sz, NULL, 0) == 0) {
+            size_t cnt = sz / sizeof(*kp);
+            for (size_t i = 0; i < cnt; i++)
+               dprintf(cfd, "%5d %s\n", kp[i].kp_proc.p_pid, kp[i].kp_proc.p_comm);
+         }
+         free(kp);
+      }
+   } else if (strncmp(line, "sysctl ", 7) == 0) {
+      char key[256] = "";
+      int val = 0;
+      int fields = sscanf(line + 7, "%255s %d", key, &val);
+      if (fields == 2) {
+         int r = sysctlbyname(key, NULL, NULL, &val, sizeof(val));
+         dprintf(cfd, "%s %d\n", r == 0 ? "OK" : "ERR", r == 0 ? val : errno);
+      } else if (fields == 1) {
+         size_t sz = sizeof(val);
+         int r = sysctlbyname(key, &val, &sz, NULL, 0);
+         dprintf(cfd, "%s %d\n", r == 0 ? "OK" : "ERR", r == 0 ? val : errno);
+      }
+   } else if (strncmp(line, "run ", 4) == 0) {
+      char *argv[32];
+      int argc = 0;
+      char *p = line + 4;
+      while (*p && argc < 31) {
+         while (*p == ' ') p++;
+         if (!*p) break;
+         argv[argc++] = p;
+         while (*p && *p != ' ') p++;
+         if (*p) *p++ = 0;
+      }
+      argv[argc] = NULL;
+      if (argc > 0) {
+         posix_spawn_file_actions_t fa;
+         posix_spawn_file_actions_init(&fa);
+         posix_spawn_file_actions_adddup2(&fa, cfd, 1);
+         posix_spawn_file_actions_adddup2(&fa, cfd, 2);
+         pid_t pid = 0;
+         int err = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
+         posix_spawn_file_actions_destroy(&fa);
+         if (err != 0) {
+            dprintf(cfd, "ERR spawn %s: %d\n", argv[0], err);
+         } else {
+            int st = 0;
+            waitpid(pid, &st, 0);
+         }
+      }
+   } else {
+      dprintf(cfd, "ERR unknown cmd\n");
+   }
+   close(cfd);
+}
+
+static void *
+herodbg_server(void *unused)
+{
+   (void)unused;
+   signal(SIGPIPE, SIG_IGN);
+   int s = socket(AF_INET, SOCK_STREAM, 0);
+   if (s < 0) {
+      herodrm_log("hero-run: herodbg socket failed: %d", errno);
+      return NULL;
+   }
+   int one = 1;
+   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+   struct sockaddr_in addr;
+   memset(&addr, 0, sizeof(addr));
+   addr.sin_family = AF_INET;
+   addr.sin_port = htons(2222);
+   addr.sin_addr.s_addr = htonl(INADDR_ANY);
+   if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(s, 8) != 0) {
+      herodrm_log("hero-run: herodbg bind/listen :2222 failed: %d", errno);
+      close(s);
+      return NULL;
+   }
+   herodrm_log("hero-run: herodbg listening on tcp :2222");
+   for (;;) {
+      int cfd = accept(s, NULL, NULL);
+      if (cfd >= 0)
+         dbg_handle_client(cfd);
+   }
+   return NULL;
+}
+
 int
 main(int main_argc, char **main_argv)
 {
@@ -1262,6 +1478,9 @@ main(int main_argc, char **main_argv)
    pthread_t devices;
    if (pthread_create(&devices, NULL, devices_start, NULL) == 0)
       pthread_detach(devices);
+   pthread_t dbg;
+   if (pthread_create(&dbg, NULL, herodbg_server, NULL) == 0)
+      pthread_detach(dbg);
    sleep(20);
    load_env();
    posix_spawn_file_actions_t fa;
