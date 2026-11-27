@@ -345,8 +345,9 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 		r = 1 / expf(logf(t->ref[i][0]) + u * (logf(t->ref[i + 1][0]) - logf(t->ref[i][0])));
 		b = 1 / expf(logf(t->ref[i][1]) + u * (logf(t->ref[i + 1][1]) - logf(t->ref[i][1])));
 	}
-	r = r < 0.65f ? 0.65f : r > 3.0f ? 3.0f : r;
-	b = b < 0.65f ? 0.65f : b > 3.0f ? 3.0f : b;
+	/* S5K4E6's unboosted raw R and B channels can require > 3x gain relative to G under indoor light. */
+	r = r < 0.5f ? 0.5f : r > 16.0f ? 16.0f : r;
+	b = b < 0.5f ? 0.5f : b > 16.0f ? 16.0f : b;
 	isp->wb[0] = isp->wb[0] * 0.9f + r * 0.1f;
 	isp->wb[2] = isp->wb[2] * 0.9f + b * 0.1f;
 }
