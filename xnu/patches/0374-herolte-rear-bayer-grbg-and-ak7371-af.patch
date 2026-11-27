@@ -1,0 +1,157 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index d9dcad2..6357694 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1918,8 +1918,11 @@ static void notefe_cam_csis_look(void);
+ static void notefe_cam_frame(vm_offset_t pins);
+ static void notefe_cam_rear_id(vm_offset_t pins);
+ static void notefe_cam_rear_frame(vm_offset_t pins);
+-static uint32_t nc_o_rear_en = 0, nc_o_rear_settle = 30, nc_o_rear_flip = 0, nc_o_rear_comp = 1;
+-static uint32_t nc_o_rear_bypass = 0, nc_o_rear_c3idx = 7, nc_o_rear_swap = 0;
++static uint32_t nc_o_rear_en = 1, nc_o_rear_settle = 30, nc_o_rear_flip = 0, nc_o_rear_comp = 1;
++static uint32_t nc_o_rear_bypass = 1, nc_o_rear_c3idx = 7, nc_o_rear_swap = 0;
++static uint32_t nc_focus = 0xffffffffu, nc_af_sda = 4, nc_af_scl = 5;
++static bool nc_af_ok;
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_focus, CTLFLAG_RD | CTLFLAG_LOCKED, &nc_focus, 0, "Rear AK7371 VCM focus position (0..1023, 0xffffffff = none)");
+ static uint8_t *nc_c3_fw_buf;
+ static uint32_t nc_c3_fw_len;
+ static int
+@@ -2896,6 +2899,79 @@ nc_c3_stream_off(void)
+ 	nc_sensor_write(0x3d, 0x6800, 0x0000, 16);                   /* HOST_INTRP_StreamEnable = 0 */
+ }
+ 
++/*
++ * (0374) AK7371 rear camera Voice Coil Motor (VCM) autofocus on ISP I2C2 (gpc2-4/5, 7-bit addr 0x0C).
++ * 9-bit position 0..511 (INF -> MACRO), active mode 0x02 = 0x00, standby 0x02 = 0x40.
++ */
++static bool
++nc_ak7371_write8_pins(unsigned sda, unsigned scl, uint8_t reg, uint8_t val)
++{
++	uint32_t ob = NC_BANK;
++	unsigned osda = NC_SDA, oscl = NC_SCL;
++	NC_BANK = 0x140; NC_SDA = sda; NC_SCL = scl;
++	nc_start();
++	bool ok = nc_byte_out(0x18u) && nc_byte_out(reg) && nc_byte_out(val);
++	nc_stop();
++	NC_BANK = ob; NC_SDA = osda; NC_SCL = oscl;
++	return ok;
++}
++
++static bool
++nc_ak7371_set_focus(uint32_t pos10)
++{
++	if (!nc_af_ok) {
++		return false;
++	}
++	if (pos10 > 1023u) {
++		pos10 = 1023u;
++	}
++	uint32_t pos9 = pos10 >> 1; /* 0..511 (AK7371 9-bit INF->MAC) */
++	uint8_t hi = (uint8_t)((pos9 >> 1) & 0xffu);
++	uint8_t lo = (uint8_t)((pos9 & 1u) << 7);
++	bool ok = nc_ak7371_write8_pins(nc_af_sda, nc_af_scl, 0x00u, hi) &&
++	    nc_ak7371_write8_pins(nc_af_sda, nc_af_scl, 0x01u, lo);
++	if (ok) {
++		nc_focus = pos10;
++	}
++	return ok;
++}
++
++static void
++nc_ak7371_init(void)
++{
++	nc_af_ok = false;
++	nc_focus = 0xffffffffu;
++	/* Release gpc2-4/5 lines high (input with board pull-up) and probe both SDA/SCL orders */
++	uint32_t ob = NC_BANK;
++	unsigned osda = NC_SDA, oscl = NC_SCL;
++	NC_BANK = 0x140; NC_SDA = 4; NC_SCL = 5;
++	nc_line(4, 1);
++	nc_line(5, 1);
++	NC_BANK = ob; NC_SDA = osda; NC_SCL = oscl;
++	if (nc_ak7371_write8_pins(4, 5, 0x02u, 0x00u)) {
++		nc_af_sda = 4; nc_af_scl = 5; nc_af_ok = true;
++	} else if (nc_ak7371_write8_pins(5, 4, 0x02u, 0x00u)) {
++		nc_af_sda = 5; nc_af_scl = 4; nc_af_ok = true;
++	}
++	if (nc_af_ok) {
++		/* Samsung AK7371_DEFAULT_FIRST_POSITION = 120 (9-bit) -> 240 (10-bit) for far/hyperfocal start */
++		nc_ak7371_set_focus(240u);
++		printf("NOTEFE CAM: AK7371 AF ready on gpc2-%u/%u, pos=%u\n", nc_af_sda, nc_af_scl, nc_focus);
++	} else {
++		printf("NOTEFE CAM: AK7371 AF did not answer on gpc2-4/5\n");
++	}
++}
++
++static void
++nc_ak7371_off(void)
++{
++	if (nc_af_ok) {
++		(void)nc_ak7371_write8_pins(nc_af_sda, nc_af_scl, 0x02u, 0x40u); /* standby */
++		nc_af_ok = false;
++		nc_focus = 0xffffffffu;
++	}
++}
++
+ static unsigned
+ nc_imx260_write_init(void)
+ {
+@@ -3527,7 +3603,7 @@ nc_stream_up(void)
+ 	}
+ 	vm_offset_t pins = nc_s.pins;
+ 	nc_pins = pins;
+-	nc_is_rear = (nc_o_rear_en != 0 && nc_sensor_id == 1);
++	nc_is_rear = (nc_o_rear_en != 0 && nc_c3_fw_buf != NULL && nc_sensor_id == 1);
+ 	if (nc_is_rear) {
+ 		NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
+ 		uint32_t con = notefe_rd(pins, 0x40);
+@@ -3631,7 +3707,8 @@ nc_stream_up(void)
+ 		nc_sensor_write(0x1a, 0x0104, 1, 8);
+ 		nc_sensor_write(0x1a, 0x0100, 1, 8);
+ 		nc_sensor_write(0x1a, 0x0104, 0, 8);
+-		printf("NOTEFE CAM: rear stream: up, IMX260 %u x %u 4-lane, %u bad writes\n", nc_w, nc_h, bad);
++		nc_ak7371_init();
++		printf("NOTEFE CAM: rear stream: up, IMX260 %u x %u 4-lane, %u bad writes, af=%d\n", nc_w, nc_h, bad, nc_af_ok);
+ 		return 0;
+ 	}
+ 	NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
+@@ -3737,6 +3814,7 @@ nc_stream_down(void)
+ 	vm_offset_t pins = nc_s.pins, csis = nc_s.csis;
+ 	if (nc_is_rear) {
+ 		NC_BANK = 0x140; NC_SDA = 0; NC_SCL = 1;
++		nc_ak7371_off();
+ 		nc_sensor_write(0x1a, 0x0100, 0, 8);
+ 		nc_c3_stream_off();
+ 		delay(40000);
+@@ -3878,11 +3956,11 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		nc_torn++;
+ 	}
+ 	struct nc_cam_frame h = { .magic = "RWFRAME", .header_bytes = sizeof(h), .width = w, .height = h_px,
+-		                  .stride = stride, .format = raw16 ? 2u : 1u, .bayer = nc_is_rear ? 0u : 2u, .black = 64, .sequence = nc_seq,
++		                  .stride = stride, .format = raw16 ? 2u : 1u, .bayer = nc_is_rear ? 1u : 2u, .black = 64, .sequence = nc_seq,
+ 		                  .time = mach_absolute_time(), .exposure_lines = nc_exp, .line_ns = nc_is_rear ? 20833u : 16340u, .gain = nc_gain,
+ 		                  .gain_unity = 0x20, .gain_max = 0x200, .frame_lines = nc_is_rear ? 1600u : 2040u,
+ 		                  .frame_lines_min = nc_is_rear ? 1600u : 2040u, .frame_lines_max = nc_is_rear ? 1600u : 2040u,
+-		                  .margin = 4, .sensor = nc_sensor_id, .focus = 0xffffffffu,
++		                  .margin = 4, .sensor = nc_sensor_id, .focus = nc_is_rear ? nc_focus : 0xffffffffu,
+ 		                  .reserved = { slot, act, f, 0, 0 } };      /* 0457: the slot read, DMA0's active pointer, FRM_CNT */
+ 	memcpy(h.magic, "RWFRAME1", 8);
+ 	int error = uiomove((caddr_t)&h, (int)MIN(sizeof(h), (size_t)uio_resid(uio)), uio);
+@@ -3939,13 +4017,16 @@ nc_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 			return error;
+ 		}
+ 		if (c.command == 3) {                          /* HAKIOS_CAMERA_SENSOR: switch front/rear when rear_en=1 */
+-			bool want_rear = (nc_o_rear_en != 0 && c.a == 1);
++			bool want_rear = (nc_o_rear_en != 0 && nc_c3_fw_buf != NULL && c.a == 1);
+ 			nc_sensor_id = c.a;
+ 			if (nc_streaming && want_rear != nc_is_rear) {
+ 				nc_stream_down();
+ 				(void)nc_stream_up();
+ 			}
+ 		}
++		if (c.command == 4 && nc_streaming && nc_is_rear) { /* HAKIOS_CAMERA_FOCUS: AK7371 VCM */
++			(void)nc_ak7371_set_focus(c.a);
++		}
+ 		if (c.command == 1 && nc_streaming) {           /* HAKIOS_CAMERA_EXPOSURE */
+ 			nc_set_exposure(c.a, c.b);
+ 			clock_interval_to_deadline(2, NSEC_PER_SEC, &nc_user_exp_until);

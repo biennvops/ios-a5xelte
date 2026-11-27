@@ -1074,6 +1074,14 @@ devices_start(__unused void *unused)
       int seven = 7, three = 3;
       (void)sysctlbyname("kern.notefe_cam_xinc", NULL, NULL, &three, sizeof(three));
       (void)sysctlbyname("kern.notefe_cam_yinc", NULL, NULL, &three, sizeof(three));
+      FILE *cf = fopen(DROP_DIR "companion_fw_imx260.bin", "rb");
+      if (cf) {
+         static unsigned char c3fw[384 * 1024];
+         size_t n = fread(c3fw, 1, sizeof(c3fw), cf);
+         fclose(cf);
+         herodrm_log("hero-run: devices: rear 73C3 firmware %zu bytes: %s", n,
+             n && sysctlbyname("kern.notefe_cam_c3fw", NULL, NULL, c3fw, n) == 0 ? "loaded" : "NOT loaded");
+      }
       herodrm_log("hero-run: devices: camera device: %s",
           sysctlbyname("kern.notefe_cam", NULL, NULL, &seven, sizeof(seven)) == 0 ? "made" : "refused");
       /* mediaserverd lists its capture sources once, at its start: again, now that /dev/hakios-camera is there */
