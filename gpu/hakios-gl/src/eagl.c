@@ -3165,7 +3165,9 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		e->line.vrb += function == FUNCTION_VARIABLE_BLUR;
 	}
 
-	if (e->unclear != 0 && reads_what_it_writes(e)) {
+	/* Do not clear the destination texture before an unprogramed self-read pass (vrd 38, edr 61, lub 66):
+	 * clearing it and then skipping the draw below leaves blurred backdrops (App Library, Safari Tabs) black. */
+	if (e->unclear != 0 && e->program == 0 && e->colour != 0 && e->colour == e->bound[0]) {
 		e->unclear = 0;
 	}
 	clear_now(e);
