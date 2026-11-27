@@ -30,6 +30,8 @@ isp_init(struct isp *isp)
 	for (int i = 0; i < 4096; i++) {
 		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
 
+		/* Gentle shadow-lifting tone curve before sRGB transfer for punchier indoor faces. */
+		v = pow(v, 0.88);
 		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
 		isp->gamma[i] = (uint8_t)(v * 255 + 0.5);
 	}
@@ -202,7 +204,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 	}
 	for (int i = 63, above = 0; i >= 0; i--) {
 		above += s->hist[i];
-		if (above * 100 >= (int)s->cells) {
+		if (above * 100 >= (int)s->cells * 3) {
 			s->bright = i * 16 + 8;
 			break;
 		}
@@ -210,7 +212,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 }
 
 /*
- * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
+ * Green's mean towards 23 % of white, unless that would put 3 % of the picture into white. The
  * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
  * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
  */
@@ -218,7 +220,7 @@ bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double target = 0.23 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
@@ -229,8 +231,8 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 	}
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
 	ratio = target / mean;
-	if (bright * ratio > 0.9 * WHITE && bright > 0) {
-		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
+	if (bright * ratio > 0.95 * WHITE && bright > 0) {
+		ratio = 0.95 * WHITE / bright > target / mean * 0.6 ? 0.95 * WHITE / bright : target / mean * 0.6;
 	}
 	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
 	if (ratio > 0.94 && ratio < 1.06) {
@@ -1051,28 +1053,140 @@ isp_tune(struct isp *isp, float lux_index, float cct)
 	isp->lsc.on = true;
 }
 
-/* ---- Note FE: the moving picture made from cells once ------------------------------------------------- */
+/* ---- Full-resolution fast bilinear demosaic for preview + Y-plane unsharp mask ------------------------- */
 /*
- * The preview (1504x1128) from a binned 1304x980 frame is "magnified": every output pixel blended four cells and ran
- * the colour pipeline (6.5 fps, mediaserverd at ~650%, cam-t1). Here each cell of the crop goes through the pipeline once
- * (render_line at the crop's own size: one pixel a cell), and the picture is scaled up from those 8-bit colours.
+ * Preview uses the full demosaiced crop (e.g. 1304x980 instead of 652x490 cell-averaging — 4x more pixels)
+ * via direct Bayer-phase 4-neighbor interpolation (no nested 3x3 loop), then scales to the output NV12 buffer.
  */
 void
 isp_cell_size(const struct isp *isp, const struct hakios_camera_frame *f, uint32_t width, uint32_t height, uint32_t *cw,
     uint32_t *ch)
 {
-	uint32_t x0, y0;
+	uint32_t x0, y0, c_w, c_h;
 
-	crop(isp, f, width, height, &x0, &y0, cw, ch);
+	crop(isp, f, width, height, &x0, &y0, &c_w, &c_h);
+	*cw = c_w * 2;
+	*ch = c_h * 2;
 }
 
 void
 isp_render_cells(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *cells, uint32_t cw,
     uint32_t ch, uint32_t first_row, uint32_t end_row)
 {
-	for (uint32_t row = first_row; row < end_row && row < ch; row++) {
-		render_line(isp, f, raw, cw, ch, row, cells + (size_t)row * cw * 3);
+	uint32_t cx0, cy0, c_w, c_h;
+	int colour[4];
+	struct pipe p;
+	int rowbuf[3][8192];
+
+	if (f->width > 8192 || cw == 0 || ch == 0) {
+		return;
 	}
+	crop(isp, f, cw, ch, &cx0, &cy0, &c_w, &c_h);
+	uint32_t sx0 = cx0 * 2, sy0 = cy0 * 2;
+	cfa(f->bayer, colour);
+	pipe_init(isp, &p);
+
+	uint32_t r0 = first_row < ch ? first_row : ch;
+	uint32_t r1 = end_row < ch ? end_row : ch;
+	if (r0 >= r1) {
+		return;
+	}
+	int cur_y = (int)(sy0 + (isp->turned ? (ch - 1 - r0) : r0));
+	unpack_line(f, raw, cur_y - 1, rowbuf[0]);
+	unpack_line(f, raw, cur_y,     rowbuf[1]);
+	unpack_line(f, raw, cur_y + 1, rowbuf[2]);
+
+	for (uint32_t row = r0; row < r1; row++) {
+		int y = (int)(sy0 + (isp->turned ? (ch - 1 - row) : row));
+		if (row > r0) {
+			if (isp->turned) {
+				/* y decreased by 1 */
+				memcpy(rowbuf[2], rowbuf[1], f->width * sizeof(int));
+				memcpy(rowbuf[1], rowbuf[0], f->width * sizeof(int));
+				unpack_line(f, raw, y - 1, rowbuf[0]);
+			} else {
+				/* y increased by 1 */
+				memcpy(rowbuf[0], rowbuf[1], f->width * sizeof(int));
+				memcpy(rowbuf[1], rowbuf[2], f->width * sizeof(int));
+				unpack_line(f, raw, y + 1, rowbuf[2]);
+			}
+		}
+		const int *up = rowbuf[0], *mid = rowbuf[1], *dn = rowbuf[2];
+		uint8_t *dst = cells + (size_t)row * cw * 3;
+		int row_c0 = colour[(y & 1) * 2 + 0];
+		int row_c1 = colour[(y & 1) * 2 + 1];
+		int w_max = (int)f->width - 1;
+
+		for (uint32_t col = 0; col < cw; col++) {
+			int x = (int)(sx0 + col);
+			int xm = x > 0 ? x - 1 : 0;
+			int xp = x < w_max ? x + 1 : w_max;
+			int c = (x & 1) ? row_c1 : row_c0;
+			float rv, gv, bv;
+
+			if (c == 1) { /* Green site */
+				gv = (float)mid[x];
+				int h_c = (x & 1) ? row_c0 : row_c1;
+				float h_avg = 0.5f * (mid[xm] + mid[xp]);
+				float v_avg = 0.5f * (up[x] + dn[x]);
+				if (h_c == 0) {
+					rv = h_avg;
+					bv = v_avg;
+				} else {
+					rv = v_avg;
+					bv = h_avg;
+				}
+			} else { /* Red (0) or Blue (2) site */
+				float self = (float)mid[x];
+				float diag = 0.25f * (up[xm] + up[xp] + dn[xm] + dn[xp]);
+				gv = 0.25f * (up[x] + dn[x] + mid[xm] + mid[xp]);
+				if (c == 0) {
+					rv = self;
+					bv = diag;
+				} else {
+					rv = diag;
+					bv = self;
+				}
+			}
+			pixel(isp, &p, rv, gv, bv, dst + 3 * (isp->turned ? (cw - 1 - col) : col));
+		}
+	}
+}
+
+/* Lightweight 3x3 unsharp mask on NV12 Y plane (strength in 1/16ths, e.g. 6 = 0.375x). */
+void
+isp_sharpen_y(uint8_t *y, size_t y_stride, uint32_t width, uint32_t height, int strength16)
+{
+	if (width < 4 || height < 4 || strength16 <= 0) {
+		return;
+	}
+	uint8_t *prev = malloc(width);
+	uint8_t *cur = malloc(width);
+	if (prev == NULL || cur == NULL) {
+		free(prev);
+		free(cur);
+		return;
+	}
+	memcpy(prev, y, width);
+	memcpy(cur, y + y_stride, width);
+	for (uint32_t r = 1; r + 1 < height; r++) {
+		uint8_t *out = y + (size_t)r * y_stride;
+		const uint8_t *next = y + (size_t)(r + 1) * y_stride;
+		for (uint32_t x = 1; x + 1 < width; x++) {
+			int c = cur[x];
+			int blur = (prev[x] + next[x] + cur[x - 1] + cur[x + 1] + 2) >> 2;
+			int diff = c - blur;
+			/* Soft noise coring: ignore +/-2 luma sensor noise */
+			if (diff > 2 || diff < -2) {
+				int v = c + ((diff * strength16) >> 4);
+				out[x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+			}
+		}
+		memcpy(prev, cur, width);
+		memcpy(cur, next, width);
+	}
+	free(prev);
+	free(cur);
 }
 
 static void

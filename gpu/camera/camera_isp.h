@@ -128,6 +128,7 @@ void isp_render_still_nv12(const struct isp *isp, const struct hakios_camera_fra
     bool video_range);
 void isp_render_full_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t first_row, uint32_t end_row, bool video_range);
+void isp_sharpen_y(uint8_t *y, size_t y_stride, uint32_t width, uint32_t height, int strength16);
 /*
  * Lens shading measured from a frame of a flat field (a white sheet held over the lens, evenly lit):
  * each colour's level at each grid point (a block's mean) over the brightest of its own; false if
