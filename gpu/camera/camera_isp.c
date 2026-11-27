@@ -416,20 +416,24 @@ static inline void
 pixel(const struct isp *isp, const struct pipe *p, float r, float g, float b, uint8_t *rgb)
 {
 	/*
-	 * Note FE: where green nears the 10-bit top (959 above black 64) red and blue are pulled toward white: the 4E6's red
-	 * and blue need ~3-10x, so a clipped green with them still climbing showed bright light as magenta (owner).
+	 * Highlight roll-off to neutral white: when any raw 10-bit channel nears saturation (959 above black 64),
+	 * WB gains > 1 on R/B would push R_wb and B_wb past G_wb, causing the CCM to crush G and clip bright
+	 * highlights to neon pink/magenta. Pull R and B smoothly to neutral WB-equivalent of G so [V,V,V]*CCM = white.
 	 */
-	if (g > 820) {
-		float t = (g - 820) / (959 - 820);
-		t = t > 1 ? 1 : t;
-		if (p->m[0][0] > 0) {
-			float rw = g * p->m[1][1] / p->m[0][0];
-			r = r < rw ? r + t * (rw - r) : r;
+	float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+	if (mx > 820.0f) {
+		float t = (mx - 820.0f) * (1.0f / (959.0f - 820.0f));
+		t = t > 1.0f ? 1.0f : t;
+		float w = g > mx * 0.7f ? g : mx;
+		if (isp->wb[0] > 0.0f) {
+			float rw = w * (isp->wb[1] / isp->wb[0]);
+			r += t * (rw - r);
 		}
-		if (p->m[2][2] > 0) {
-			float bw = g * p->m[1][1] / p->m[2][2];
-			b = b < bw ? b + t * (bw - b) : b;
+		if (isp->wb[2] > 0.0f) {
+			float bw = w * (isp->wb[1] / isp->wb[2]);
+			b += t * (bw - b);
 		}
+		g += t * (w - g);
 	}
 	if (p->identity) {
 		rgb[0] = curve(isp, r * p->m[0][0]);
