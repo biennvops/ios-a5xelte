@@ -1599,12 +1599,16 @@ worker(void *context)
 			w_since += last_end ? (t_end - last_end) * k : 0;
 			last_end = t_end;
 			if (s->frames % 30 == 0) {
+				static uint32_t prev_hwf;
+				uint32_t hwf = f->reserved[2];
+				uint32_t dhw = hwf - prev_hwf;
+				prev_hwf = hwf;
 				FILE *tf = fopen("/private/var/herolte/cam.timing", "w");
 				if (tf) {
-					fprintf(tf, "%ux%u fmt=%u: %.1f ms (%.1f fps): read %.1f, measure %.1f, give %.1f | exp=%u gain=%.1fx wb=%.2f/%.2f\n",
+					fprintf(tf, "%ux%u fmt=%u: %.1f ms (%.1f fps): read %.1f, measure %.1f, give %.1f | hwf+%u (%.1f hwfps) exp=%u gain=%.1fx wb=%.2f/%.2f\n",
 					    f->width, f->height, f->format, w_since / 30, w_since > 0 ? 30000 / w_since : 0,
-					    w_read / 30, w_isp / 30, w_give / 30, f->exposure_lines, (double)f->gain / f->gain_unity,
-					    isp.wb[0], isp.wb[2]);
+					    w_read / 30, w_isp / 30, w_give / 30, dhw, w_since > 0 ? (dhw * 1000.0) / w_since : 0,
+					    f->exposure_lines, (double)f->gain / f->gain_unity, isp.wb[0], isp.wb[2]);
 					fclose(tf);
 				}
 				say("timing, a frame on average over 30: %.1f ms in all (%.1f fps): read %.1f, measure %.1f, give %.1f",

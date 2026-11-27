@@ -1,0 +1,13 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 28140f6..9be5638 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1716,7 +1716,7 @@ notefe_physmap_cached(uint64_t pa, uint64_t len)
+ 	if (!md) {
+ 		return 0;
+ 	}
+-	IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapDefaultCache);
++	IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache);
+ 	if (!map) {
+ 		md->release();
+ 		return 0;
