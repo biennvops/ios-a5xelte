@@ -602,6 +602,86 @@ isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, cons
 	if (width > 8192) {
 		return;
 	}
+	uint32_t x0, y0, cw, ch;
+	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	/* Fast single-pass integer Q10 path for 5 MP native 16-bit RAW10 (format=2): skips 3.8 MB RGB intermediate & float loop. */
+	if (f->format == 2 && !isp->lsc.on && cw >= 1000) {
+		int r_idx, b_idx;
+		struct pipe p;
+		cell_places(f->bayer, &r_idx, &b_idx);
+		pipe_init(isp, &p);
+		int32_t im[3][3];
+		for (int c = 0; c < 3; c++) {
+			for (int j = 0; j < 3; j++) {
+				im[c][j] = (int32_t)(p.m[c][j] * 1024.0f + (p.m[c][j] >= 0 ? 0.5f : -0.5f));
+			}
+		}
+		int32_t wb_r_q10 = isp->wb[0] > 0.0f ? (int32_t)(isp->wb[1] / isp->wb[0] * 1024.0f + 0.5f) : 1024;
+		int32_t wb_b_q10 = isp->wb[2] > 0.0f ? (int32_t)(isp->wb[1] / isp->wb[2] * 1024.0f + 0.5f) : 1024;
+		int g0_idx = (r_idx == 0 || b_idx == 0) ? 1 : 0;
+		int g1_idx = 3 - g0_idx;
+		int black = (int)f->black;
+		uint32_t stride_u16 = f->stride >> 1;
+		uint32_t cx_lut[8192];
+		uint64_t step = ((uint64_t)cw << 16) / width, at = (uint64_t)x0 << 16;
+		for (uint32_t x = 0; x < width; x++, at += step) {
+			cx_lut[x] = (uint32_t)(at >> 16) * 2u;
+		}
+		const uint8_t *gamma = isp->gamma;
+		bool turned = isp->turned;
+		uint32_t prev_cy = ~0u;
+
+		for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+			bool second = row + 1 < height;
+			for (int k = 0; k < 2; k++) {
+				uint32_t rr = k == 0 ? row : (second ? row + 1 : row);
+				uint32_t srow = turned ? (height - 1 - rr) : rr;
+				uint32_t cy = y0 + (uint32_t)((uint64_t)srow * ch / height);
+				if (k == 1 && cy == prev_cy) {
+					memcpy(line[1], line[0], (size_t)width * 3);
+					continue;
+				}
+				prev_cy = cy;
+				const uint16_t *t0 = (const uint16_t *)raw + (size_t)cy * 2u * stride_u16;
+				const uint16_t *t1 = t0 + stride_u16;
+				uint8_t *dst = line[k];
+				for (uint32_t x = 0; x < width; x++) {
+					uint32_t sx = cx_lut[x];
+					int v[4];
+					v[0] = (int)(t0[sx] & 0x3ffu) - black;
+					v[1] = (int)(t0[sx + 1] & 0x3ffu) - black;
+					v[2] = (int)(t1[sx] & 0x3ffu) - black;
+					v[3] = (int)(t1[sx + 1] & 0x3ffu) - black;
+					if (v[0] < 0) v[0] = 0;
+					if (v[1] < 0) v[1] = 0;
+					if (v[2] < 0) v[2] = 0;
+					if (v[3] < 0) v[3] = 0;
+					int rv = v[r_idx], gv = (v[g0_idx] + v[g1_idx]) >> 1, bv = v[b_idx];
+					int mx = rv > gv ? (rv > bv ? rv : bv) : (gv > bv ? gv : bv);
+					if (__builtin_expect(mx > 820, 0)) {
+						int t_q8 = ((mx - 820) * 256) / (959 - 820);
+						if (t_q8 > 256) t_q8 = 256;
+						int wv = gv > (mx * 7) / 10 ? gv : mx;
+						int rw = (wv * wb_r_q10) >> 10;
+						int bw = (wv * wb_b_q10) >> 10;
+						rv += ((rw - rv) * t_q8) >> 8;
+						bv += ((bw - bv) * t_q8) >> 8;
+						gv += ((wv - gv) * t_q8) >> 8;
+					}
+					int o0 = (im[0][0] * rv + im[0][1] * gv + im[0][2] * bv + 512) >> 10;
+					int o1 = (im[1][0] * rv + im[1][1] * gv + im[1][2] * bv + 512) >> 10;
+					int o2 = (im[2][0] * rv + im[2][1] * gv + im[2][2] * bv + 512) >> 10;
+					uint8_t *px = dst + 3u * (turned ? (width - 1 - x) : x);
+					px[0] = gamma[o0 < 0 ? 0 : o0 > 4095 ? 4095 : o0];
+					px[1] = gamma[o1 < 0 ? 0 : o1 > 4095 ? 4095 : o1];
+					px[2] = gamma[o2 < 0 ? 0 : o2 > 4095 ? 4095 : o2];
+				}
+			}
+			nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+			    uv + (size_t)(row / 2) * uv_stride, video_range);
+		}
+		return;
+	}
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
 		bool second = row + 1 < height;
 
@@ -1087,7 +1167,10 @@ isp_cell_size(const struct isp *isp, const struct hakios_camera_frame *f, uint32
 
 	crop(isp, f, width, height, &x0, &y0, &c_w, &c_h);
 	/* For binned 1304x980 (652x490 cells), demosaic to full 1304x980; for 5 MP 2608x1960, 1304x980 cells are already crisp. */
-	if (c_w < 1000 && c_w * 2 <= width && c_h * 2 <= height) {
+	if (f->format == 2 && !isp->lsc.on && c_w >= 1000) {
+		*cw = 0;
+		*ch = 0;
+	} else if (c_w < 1000 && c_w * 2 <= width && c_h * 2 <= height) {
 		*cw = c_w * 2;
 		*ch = c_h * 2;
 	} else {

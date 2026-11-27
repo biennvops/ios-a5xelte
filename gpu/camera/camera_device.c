@@ -1598,9 +1598,17 @@ worker(void *context)
 			w_give += (t_end - t_isp) * k;
 			w_since += last_end ? (t_end - last_end) * k : 0;
 			last_end = t_end;
-			if (s->frames % 60 == 0) {
-				say("timing, a frame on average over 60: %.1f ms in all (%.1f fps): read %.1f, measure %.1f, give %.1f",
-				    w_since / 60, w_since > 0 ? 60000 / w_since : 0, w_read / 60, w_isp / 60, w_give / 60);
+			if (s->frames % 30 == 0) {
+				FILE *tf = fopen("/private/var/herolte/cam.timing", "w");
+				if (tf) {
+					fprintf(tf, "%ux%u fmt=%u: %.1f ms (%.1f fps): read %.1f, measure %.1f, give %.1f | exp=%u gain=%.1fx wb=%.2f/%.2f\n",
+					    f->width, f->height, f->format, w_since / 30, w_since > 0 ? 30000 / w_since : 0,
+					    w_read / 30, w_isp / 30, w_give / 30, f->exposure_lines, (double)f->gain / f->gain_unity,
+					    isp.wb[0], isp.wb[2]);
+					fclose(tf);
+				}
+				say("timing, a frame on average over 30: %.1f ms in all (%.1f fps): read %.1f, measure %.1f, give %.1f",
+				    w_since / 30, w_since > 0 ? 30000 / w_since : 0, w_read / 30, w_isp / 30, w_give / 30);
 				w_read = w_isp = w_give = w_since = 0;
 			}
 		}
