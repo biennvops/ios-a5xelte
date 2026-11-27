@@ -601,8 +601,6 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	return image;
 }
 
-extern void herodrm_surface_forget(uint32_t surface_id);
-
 static void
 image_forget(struct eagl *e, GLuint texture)
 {
@@ -610,7 +608,6 @@ image_forget(struct eagl *e, GLuint texture)
 
 	if (image != NULL) {
 		unsigned idx = (unsigned)(image - e->images);
-		uint32_t sid = (image->shared || image->mirror != 0) ? IOSurfaceGetID(image->surface) : 0;
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
@@ -623,18 +620,6 @@ image_forget(struct eagl *e, GLuint texture)
 			*image = e->images[last];
 			if (image->texture < IMAGE_INDEX_MAX) {
 				e->image_slot[image->texture] = (uint16_t)(idx + 1);
-			}
-		}
-		if (sid != 0) {
-			bool still_used = false;
-			for (unsigned i = 0; i < e->image_count; i++) {
-				if (IOSurfaceGetID(e->images[i].surface) == sid) {
-					still_used = true;
-					break;
-				}
-			}
-			if (!still_used) {
-				herodrm_surface_forget(sid);
 			}
 		}
 	}
