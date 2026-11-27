@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
-index ebbbee4..7db1825 100644
+index ebbbee4..b858569 100644
 --- a/bsd/dev/herolte_gl.c
 +++ b/bsd/dev/herolte_gl.c
 @@ -1916,6 +1916,9 @@ nc_read(uint8_t slave, uint8_t reg, uint8_t *v, unsigned n)
@@ -143,3 +143,12 @@ index ebbbee4..7db1825 100644
  static void
  notefe_cam_csis_look(void)
  {
+@@ -3167,7 +3287,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 7) {
++	if (value < 1 || value > 9) {
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
