@@ -1379,16 +1379,16 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	}
 }
 
-static int cam_cfg_bayer = 0;   /* S5K4E6 binned RAW10 is RGGB(0) or BGGR(3); overridable live via cam.cfg */
+static int cam_cfg_bayer = 2;   /* S5K4E6 with 0x0101=3 is SENSOR_OUTPUT_FORMAT_RAW_Gb = GBRG(2); overridable live via cam.cfg */
 static int cam_cfg_turned = -1; /* -1 = use camera->turned, 0/1 = override */
-static float cam_cfg_sat = 1.0f;
+static float cam_cfg_sat = 0.6f;
 
 static void
 load_cam_cfg(void)
 {
-	cam_cfg_bayer = 0;
+	cam_cfg_bayer = 2;
 	cam_cfg_turned = -1;
-	cam_cfg_sat = 1.0f;
+	cam_cfg_sat = 0.6f;
 	FILE *f = fopen("/private/var/herolte/cam.cfg", "r");
 	if (f == NULL) {
 		return;

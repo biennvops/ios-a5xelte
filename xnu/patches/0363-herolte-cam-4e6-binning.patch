@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index b13ea9c..bce9bd9 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2394,11 +2394,15 @@ extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
+ static vm_offset_t nc_frame_c;          /* 0467: the ring, cacheable, for /dev/hakios-camera's reads */
+ static uint32_t nc_w = NC_FULL_W, nc_h = NC_FULL_H;
+ static uint32_t nc_o_tp, nc_o_skip, nc_o_pll = 166, nc_o_settle = 22, nc_o_mode;
++static uint32_t nc_o_flip = 3, nc_o_xinc = 1, nc_o_yinc = 3;
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_tp, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_tp, 0, "Note FE camera: test pattern (0 off)");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_skip, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_skip, 0, "Note FE camera: 1 no AE, 2 no picture");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_pll, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_pll, 0, "Note FE camera: sensor PLL multiplier");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_settle, 0, "Note FE camera: CSIS settle");
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_mode, 0, "Note FE camera: 0 full, 1 binned, 2 720p crop");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_flip, 0, "Note FE camera: 0x0101 H/V mirror (0..3)");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_xinc, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_xinc, 0, "Note FE camera: 0x0383 x_odd_inc (1 or 3)");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_yinc, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_yinc, 0, "Note FE camera: 0x0387 y_odd_inc (3 for 2x2 binning)");
+ 
+ static bool
+ nc_sensor_write(uint8_t a7, uint16_t reg, uint16_t val, int bits)
+@@ -2591,9 +2595,11 @@ notefe_cam_frame(vm_offset_t pins)
+ 		uint16_t v = nc_4e6_mode[i].reg == 0x0306 ? (uint16_t)pll : nc_4e6_mode[i].val;
+ 		bad += !nc_sensor_write(0x35, nc_4e6_mode[i].reg, v, nc_4e6_mode[i].bits);
+ 	}
+-	if (mode == 1) {        /* SMIA 2x2 binning (0x0900 enable, 0x0901 type 0x22), output 1304 x 980 */
++	if (mode == 1) {        /* SMIA 2x2 binning (0x0900/0x0901 + 0x0383/0x0387 odd_inc), output 1304 x 980 */
+ 		bad += !nc_sensor_write(0x35, 0x0900, 0x01, 8);
+ 		bad += !nc_sensor_write(0x35, 0x0901, 0x22, 8);
++		bad += !nc_sensor_write(0x35, 0x0383, (uint16_t)nc_o_xinc, 8);
++		bad += !nc_sensor_write(0x35, 0x0387, (uint16_t)nc_o_yinc, 8);
+ 		bad += !nc_sensor_write(0x35, 0x034c, 1304, 16);
+ 		bad += !nc_sensor_write(0x35, 0x034e, 980, 16);
+ 	} else if (mode == 2) { /* SMIA crop: x 664-1943, y 620-1339, output 1280 x 720 */
+@@ -2889,8 +2895,11 @@ nc_stream_up(void)
+ 	}
+ 	bad += !nc_sensor_write(0x35, 0x0900, 0x01, 8);
+ 	bad += !nc_sensor_write(0x35, 0x0901, 0x22, 8);
++	bad += !nc_sensor_write(0x35, 0x0383, (uint16_t)nc_o_xinc, 8);
++	bad += !nc_sensor_write(0x35, 0x0387, (uint16_t)nc_o_yinc, 8);
+ 	bad += !nc_sensor_write(0x35, 0x034c, NC_SW, 16);
+ 	bad += !nc_sensor_write(0x35, 0x034e, NC_SH, 16);
++	bad += !nc_sensor_write(0x35, 0x0101, (uint16_t)(nc_o_flip & 3u), 8);
+ 	if (nc_o_tp) {
+ 		nc_sensor_write(0x35, 0x0600, (uint16_t)nc_o_tp, 16);
+ 	}
+@@ -3033,7 +3042,7 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		nc_torn++;
+ 	}
+ 	struct nc_cam_frame h = { .magic = "RWFRAME", .header_bytes = sizeof(h), .width = NC_SW, .height = NC_SH,
+-		                  .stride = NC_STRIDE, .format = 1, .bayer = 1, .black = 64, .sequence = nc_seq,
++		                  .stride = NC_STRIDE, .format = 1, .bayer = 2, .black = 64, .sequence = nc_seq,
+ 		                  .time = mach_absolute_time(), .exposure_lines = nc_exp, .line_ns = 16340, .gain = nc_gain,
+ 		                  .gain_unity = 0x20, .gain_max = 0x200, .frame_lines = 2040, .frame_lines_min = 2040,
+ 		                  .frame_lines_max = 2040, .margin = 4, .sensor = nc_sensor_id, .focus = 0xffffffffu,
