@@ -324,10 +324,8 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 	} else if (s->grey_cells * 16 >= s->cells && s->grey[0] > 0.01 && s->grey[1] > 0.01) {
 		r = (float)(1 / s->grey[0]);
 		b = (float)(1 / s->grey[1]);
-	} else if (s->mean[0] >= 2 && s->mean[1] >= 2 && s->mean[2] >= 2) {
-		r = (float)(s->mean[1] / s->mean[0]);
-		b = (float)(s->mean[1] / s->mean[2]);
 	} else {
+		/* Frame is mostly clipped or near-black while AE is ramping: hold current WB to avoid pink/green flashes. */
 		return;
 	}
 
@@ -347,9 +345,8 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 		r = 1 / expf(logf(t->ref[i][0]) + u * (logf(t->ref[i + 1][0]) - logf(t->ref[i][0])));
 		b = 1 / expf(logf(t->ref[i][1]) + u * (logf(t->ref[i + 1][1]) - logf(t->ref[i][1])));
 	}
-	/* Note FE: the 4E6's red and blue come out ~1/15 of green under a room's light (logs/camera/raw1): up to 16x */
-	r = r < 0.5f ? 0.5f : r > 16 ? 16 : r;
-	b = b < 0.5f ? 0.5f : b > 16 ? 16 : b;
+	r = r < 0.65f ? 0.65f : r > 3.0f ? 3.0f : r;
+	b = b < 0.65f ? 0.65f : b > 3.0f ? 3.0f : b;
 	isp->wb[0] = isp->wb[0] * 0.9f + r * 0.1f;
 	isp->wb[2] = isp->wb[2] * 0.9f + b * 0.1f;
 }

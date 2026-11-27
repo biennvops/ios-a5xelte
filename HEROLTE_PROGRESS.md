@@ -696,3 +696,13 @@ Para el 8890 (kernel de Samsung `drivers/video/fbdev/exynos/decon_8890`, GPL; co
 - **Brillo OLED por hardware sobre DSIM (`0361`, `7f97b6d` + `1d9d48b`, `xnu-boot-0361-hwbl.img` `c913d7f4…285a`):**
   - `hg_bright_thread` envía la secuencia AOR de Samsung `s6e3hf4_wqhd` durante V-blank enmascarado (`0xF0 5A 5A`, `0xFC 5A 5A`, `0xB1 <hi> <lo>` con `off = 12..2520`, `0xF7 0x03/0x00`, `0xFC A5 A5`, `0xF0 A5 A5`), activado automáticamente en paneles DSC (`herohwbl=0` lo apaga) y omitiendo doble atenuación en el shader Mali.
   - **Confirmado funcionando en el teléfono** bajo zero-copy `VGR0` (`1242x2208 @3x`): el control de brillo de iOS atenúa y sube el panel OLED real en hardware (`SoC 77 °C` máx. `79 °C`).
+
+## 2026-11-27 — hero2lte: cámara frontal S5K4E6, íconos completos (`0362`), fuga VA corregida y Dropbear SSH
+
+- **Íconos a media dibujar (`0362`, `2c27306`):** `IMG_0002.PNG` + log confirmaron que los íconos de 180×180 (Shortcuts/Podcasts/Notes/Messages) quedaban congelados a ~10 filas (`1386/32400` px) porque `SweetSurface.cpp` solo cableaba `IOSurfaceAddress` alineadas a 16 KiB y copiaba una foto estática `copyin()` en direcciones desalineadas (`0x116fea380`). `0362` cablea también direcciones desalineadas con `IOMemoryDescriptor::withAddressRange()`.
+- **Fuga de 1 GiB de VA GPU en Fotos (`374d362`):** `herodrm_surface_forget()` llamado desde `eagl.c:image_forget()` libera los handles/VA de `IOSurface` importados al borrarse la textura; confirmado sin respring de `backboardd` al abrir fotos guardadas.
+- **Cámara frontal S5K4E6 (`0363`, `4812527`, `8684d78`):**
+  - El hardware frontal en `hero2lte` es idéntico al de `herolte`/`gracelte` (`S5K4E6` en CSIS2 `0x14100000`, S2MPB02 LDO5/6/13); habilitado con `cam.level=8` y `cam.media=1` (guarda JPEG con *Most Compatible*).
+  - `0363`: agrega `0x0383 = 3` (`x_odd_inc`) y `0x0387 = 3` (`y_odd_inc`) para binning 2×2 real de campo completo (`1304x980` centrado y sin estiramiento), más sysctls en vivo `kern.notefe_cam_{flip,xinc,yinc}`.
+  - `camera_device.c` + `camera_isp.c`: Bayer `GBRG (2)` (`SENSOR_OUTPUT_FORMAT_RAW_Gb` con `0x0101=3`), matriz sRGB CCM (`sat=0.6`), roll-off de altas luces a blanco neutro antes del CCM (elimina reflejos fucsia `(255,139,255)`) y retención de AWB durante rampas de exposición (evita destellos rosados/verdes al cambiar brillo).
+- **Dropbear SSH sólo por clave pública (`7e7d272`, `17e813f`):** `dropbear 2025.87` (`DROPBEAR_SVR_PASSWORD_AUTH 0`, clave ED25519 en `/var/root/.ssh/authorized_keys`), `dash 0.5.12` (`/private/var/herolte/bin/sh`), `scp` y `herobox` verificados en vivo por USB (`192.168.7.2:22`) y Wi-Fi (`192.168.1.27:22`).

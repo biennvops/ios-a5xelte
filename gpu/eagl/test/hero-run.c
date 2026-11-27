@@ -1071,7 +1071,9 @@ devices_start(__unused void *unused)
          herodrm_log("hero-run: devices: bluetooth: bluetoothd restarted (%d)", kill_by_name("bluetoothd", SIGKILL));
    }
    if (cam == 8) {
-      int seven = 7;
+      int seven = 7, three = 3;
+      (void)sysctlbyname("kern.notefe_cam_xinc", NULL, NULL, &three, sizeof(three));
+      (void)sysctlbyname("kern.notefe_cam_yinc", NULL, NULL, &three, sizeof(three));
       herodrm_log("hero-run: devices: camera device: %s",
           sysctlbyname("kern.notefe_cam", NULL, NULL, &seven, sizeof(seven)) == 0 ? "made" : "refused");
       /* mediaserverd lists its capture sources once, at its start: again, now that /dev/hakios-camera is there */

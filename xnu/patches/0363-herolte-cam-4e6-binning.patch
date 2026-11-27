@@ -6,7 +6,7 @@ index b13ea9c..bce9bd9 100644
  static vm_offset_t nc_frame_c;          /* 0467: the ring, cacheable, for /dev/hakios-camera's reads */
  static uint32_t nc_w = NC_FULL_W, nc_h = NC_FULL_H;
  static uint32_t nc_o_tp, nc_o_skip, nc_o_pll = 166, nc_o_settle = 22, nc_o_mode;
-+static uint32_t nc_o_flip = 3, nc_o_xinc = 1, nc_o_yinc = 3;
++static uint32_t nc_o_flip = 3, nc_o_xinc = 3, nc_o_yinc = 3;
  SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_tp, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_tp, 0, "Note FE camera: test pattern (0 off)");
  SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_skip, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_skip, 0, "Note FE camera: 1 no AE, 2 no picture");
  SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_pll, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_pll, 0, "Note FE camera: sensor PLL multiplier");
