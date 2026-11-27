@@ -1402,10 +1402,54 @@ dbg_handle_client(int cfd)
 }
 
 static void *
+herodbg_udp_dialer(void *unused)
+{
+   (void)unused;
+   int u = socket(AF_INET, SOCK_DGRAM, 0);
+   if (u < 0)
+      return NULL;
+   int one = 1;
+   setsockopt(u, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+   struct sockaddr_in loc;
+   memset(&loc, 0, sizeof(loc));
+   loc.sin_family = AF_INET;
+   loc.sin_port = htons(2222);
+   loc.sin_addr.s_addr = htonl(INADDR_ANY);
+   if (bind(u, (struct sockaddr *)&loc, sizeof(loc)) != 0) {
+      close(u);
+      return NULL;
+   }
+   for (;;) {
+      char buf[64];
+      struct sockaddr_in from;
+      socklen_t flen = sizeof(from);
+      ssize_t n = recvfrom(u, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
+      if (n <= 0)
+         continue;
+      buf[n] = 0;
+      unsigned port = 0;
+      if (sscanf(buf, "dial %u", &port) == 1 && port >= 1024 && port <= 65535) {
+         int c = socket(AF_INET, SOCK_STREAM, 0);
+         if (c >= 0) {
+            from.sin_port = htons((uint16_t)port);
+            if (connect(c, (struct sockaddr *)&from, sizeof(from)) == 0)
+               dbg_handle_client(c);
+            else
+               close(c);
+         }
+      }
+   }
+   return NULL;
+}
+
+static void *
 herodbg_server(void *unused)
 {
    (void)unused;
    signal(SIGPIPE, SIG_IGN);
+   pthread_t ud;
+   if (pthread_create(&ud, NULL, herodbg_udp_dialer, NULL) == 0)
+      pthread_detach(ud);
    int s = socket(AF_INET, SOCK_STREAM, 0);
    if (s < 0) {
       herodrm_log("hero-run: herodbg socket failed: %d", errno);

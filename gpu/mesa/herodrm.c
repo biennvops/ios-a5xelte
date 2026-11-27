@@ -69,7 +69,7 @@ static io_connect_t conn;
 static struct hbo bos[MAX_BOS + 1];     /* indexed by userspace handle (khandle = kernel handle, 0 if purged) */
 static uint64_t evictable_bytes;
 #define MAX_PRIME 256
-static struct { int fd; uint32_t handle; } primes[MAX_PRIME];  /* imported surfaces' stand-in descriptors */
+static struct { int fd; uint32_t handle; uint32_t surface_id; } primes[MAX_PRIME];  /* imported surfaces' stand-in descriptors */
 static int debug = -1;
 static uint64_t submits, faults;
 
@@ -385,6 +385,7 @@ free_bo(uint32_t handle)
       if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
          close(primes[i].fd);
          primes[i].handle = 0;
+         primes[i].surface_id = 0;
       }
    bo_wait(handle);
    bo_last_job[handle] = 0;
@@ -895,6 +896,7 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
             bos[u] = (struct hbo){ .khandle = (uint32_t)out[0], .va = out[1], .size = out[2], .in_use = true };
             primes[slot].fd = fd;
             primes[slot].handle = u;
+            primes[slot].surface_id = surface_id;
             *info = (struct herodrm_surface){ .handle = u, .size = out[2],
                .bytes_per_row = (uint32_t)out[3], .width = (uint32_t)out[4], .height = (uint32_t)out[5],
                .pixel_format = (uint32_t)out[6], .offset = (uint32_t)out[7], .planes = (uint32_t)out[8] };
@@ -925,6 +927,36 @@ herodrm_bo_sync(uint32_t handle)
    uint32_t kr = (conn && in) ? call(SEL_SYNC_BO, &in, 1, NULL, 0) : 1;
    pthread_mutex_unlock(&lock);
    return kr ? fail(EINVAL) : 0;
+}
+
+/* Release the kernel GPU VA + SweetSurface ref for an imported IOSurface whose GL texture was deleted. */
+EXPORT void
+herodrm_surface_forget(uint32_t surface_id)
+{
+   if (!surface_id)
+      return;
+   pthread_mutex_lock(&lock);
+   for (int i = 0; i < MAX_PRIME; i++) {
+      if (primes[i].handle && primes[i].surface_id == surface_id) {
+         uint32_t u = primes[i].handle;
+         close(primes[i].fd);
+         primes[i].handle = 0;
+         primes[i].surface_id = 0;
+         if (u <= MAX_BOS && bos[u].in_use && !bos[u].purged && bos[u].khandle) {
+            bo_wait(u);
+            bo_last_job[u] = 0;
+            uint64_t in = bos[u].khandle;
+            call(SEL_FREE, &in, 1, NULL, 0);
+            st.frees++;
+            bos[u].khandle = 0;
+            bos[u].va = 0;
+            bos[u].size = 0;
+            bos[u].cpu = 0;
+            bos[u].purged = true;
+         }
+      }
+   }
+   pthread_mutex_unlock(&lock);
 }
 
 EXPORT int64_t
