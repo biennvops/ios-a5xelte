@@ -134,11 +134,12 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 
 	memset(s, 0, sizeof(*s));
 	cell_places(f->bayer, &r, &b);
-	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
+	uint32_t step = cells_w >= 1000 ? 8 : 4;
+	for (uint32_t cy = 0; cy < cells_h; cy += step) {
 		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 		float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
 
-		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
+		for (uint32_t cx = 0; cx < cells_w; cx += step) {
 			int v[4], g = 0, top_v = 0;
 
 			cell(top, f->stride, cx, v);
@@ -1065,8 +1066,14 @@ isp_cell_size(const struct isp *isp, const struct hakios_camera_frame *f, uint32
 	uint32_t x0, y0, c_w, c_h;
 
 	crop(isp, f, width, height, &x0, &y0, &c_w, &c_h);
-	*cw = c_w * 2;
-	*ch = c_h * 2;
+	/* For binned 1304x980 (652x490 cells), demosaic to full 1304x980; for 5 MP 2608x1960, 1304x980 cells are already crisp. */
+	if (c_w < 1000 && c_w * 2 <= width && c_h * 2 <= height) {
+		*cw = c_w * 2;
+		*ch = c_h * 2;
+	} else {
+		*cw = c_w;
+		*ch = c_h;
+	}
 }
 
 void
@@ -1082,6 +1089,13 @@ isp_render_cells(const struct isp *isp, const struct hakios_camera_frame *f, con
 		return;
 	}
 	crop(isp, f, cw, ch, &cx0, &cy0, &c_w, &c_h);
+	if (cw == c_w && ch == c_h) {
+		/* One pixel per 2x2 Bayer cell (e.g. 1304x980 from 5 MP 2608x1960): fast direct path. */
+		for (uint32_t row = first_row; row < end_row && row < ch; row++) {
+			render_line(isp, f, raw, cw, ch, row, cells + (size_t)row * cw * 3);
+		}
+		return;
+	}
 	uint32_t sx0 = cx0 * 2, sy0 = cy0 * 2;
 	cfa(f->bayer, colour);
 	pipe_init(isp, &p);
