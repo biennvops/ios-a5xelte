@@ -22,6 +22,7 @@ int hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface);
 
 /* (Galaxy S7 port) The GPU has drawn into that surface's memory: wait for it, and make it visible to the CPU and the display. */
 void hakios_gl_surface_written(struct hakios_gl *gl, uint32_t surface);
+void hakios_gl_surface_forget(struct hakios_gl *gl, uint32_t surface);
 
 /*
  * CoreAnimation draws a layer's pixels with one of ninety "functions" (a fragment shader each); these

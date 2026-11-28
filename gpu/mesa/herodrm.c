@@ -51,7 +51,7 @@ kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO, SEL_SUBMIT_BATCH, SEL_ENQUEUE, SEL_WAIT_SEQ };
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO, SEL_SUBMIT_BATCH, SEL_ENQUEUE, SEL_WAIT_SEQ, SEL_ENQUEUE_BATCH };
 
 #define MAX_BOS 4096
 
@@ -60,6 +60,7 @@ struct hbo {
    uint64_t va, size;
    uint64_t cpu;
    bool in_use;
+   bool pooled;
    bool evictable;
    bool purged;
 };
@@ -68,8 +69,6 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static io_connect_t conn;
 static struct hbo bos[MAX_BOS + 1];     /* indexed by userspace handle (khandle = kernel handle, 0 if purged) */
 static uint64_t evictable_bytes;
-static uint64_t prime_bytes;
-#define MAX_PRIME_BYTES (160ull * 1024ull * 1024ull) /* keep permanent hero_hw imports well below 1 GiB Mali user VA */
 #define MAX_PRIME 256
 static struct { int fd; uint32_t handle; uint32_t surface_id; } primes[MAX_PRIME];  /* imported surfaces' stand-in descriptors */
 static int debug = -1;
@@ -80,9 +79,9 @@ static uint64_t submits, faults;
  * kernel zeroes, cleans and maps every new buffer). */
 static struct {
    uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
-   uint64_t sel_calls[11], sel_ns[11];  /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
+   uint64_t sel_calls[12], sel_ns[12];  /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
 } st;
-static const char *const sel_names[11] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo", "batch", "enq", "wait" };
+static const char *const sel_names[12] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo", "batch", "enq", "wait", "enqb" };
 
 EXPORT void herodrm_log(const char *fmt, ...);
 
@@ -110,7 +109,7 @@ stats_tick(uint64_t t)
                (unsigned long long)st.frees);
    char by[512];
    int used = 0;
-   for (int i = 0; i < 11 && used < (int)sizeof(by) - 48; i++) {
+   for (int i = 0; i < 12 && used < (int)sizeof(by) - 48; i++) {
       if (st.sel_calls[i] && i != 5)
          used += snprintf(by + used, sizeof(by) - used, " %s %llu/%.1fms", sel_names[i],
                           (unsigned long long)st.sel_calls[i], st.sel_ns[i] / 1e6);
@@ -127,7 +126,7 @@ call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nou
    uint32_t n = nout;
    uint64_t t0 = now_ns();
    kern_return_t kr = IOConnectCallMethod(conn, sel, in, nin, NULL, 0, out, &n, NULL, NULL);
-   if (sel < 11) {
+   if (sel < 12) {
       st.sel_calls[sel]++;
       st.sel_ns[sel] += now_ns() - t0;
    }
@@ -262,12 +261,64 @@ heap_cap(void)
    return (mb ? mb : 32) << 20;
 }
 
-static bool async_on, kfifo_on;
-static uint64_t kfifo_done, kfifo_gpu_us;
+static bool async_on, kfifo_on, kfifo_batch_on;
+static uint64_t kfifo_done, kfifo_gpu_us, kfifo_seq;
 static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
 static void queue_drain(void);
+static void kfifo_flush_batch(void);
 static bool bo_busy(uint32_t handle);
 static void bo_wait(uint32_t handle);
+
+#define BO_POOL_MAX       64
+#define BO_POOL_ITEM_MAX  (2u * 1024u * 1024u)
+#define BO_POOL_BYTES_MAX (24u * 1024u * 1024u)
+static uint32_t bo_pool[BO_POOL_MAX];
+static unsigned bo_pool_count;
+static uint64_t bo_pool_bytes;
+
+static void
+bo_pool_flush(void)
+{
+   while (bo_pool_count > 0) {
+      uint32_t h = bo_pool[--bo_pool_count];
+      bo_pool_bytes -= bos[h].size;
+      bo_wait(h);
+      bo_last_job[h] = 0;
+      uint64_t in = bos[h].khandle;
+      call(SEL_FREE, &in, 1, NULL, 0);
+      st.frees++;
+      memset(&bos[h], 0, sizeof(bos[h]));
+   }
+}
+
+static uint32_t
+bo_pool_take(uint64_t page_size)
+{
+   for (unsigned i = 0; i < bo_pool_count; i++) {
+      uint32_t h = bo_pool[i];
+      if (bos[h].size == page_size && !bo_busy(h)) {
+         bo_pool[i] = bo_pool[--bo_pool_count];
+         bo_pool_bytes -= bos[h].size;
+         bos[h].pooled = false;
+         if (!bos[h].cpu) {
+            uint64_t in = bos[h].khandle, out = 0;
+            if (call(SEL_MAP, &in, 1, &out, 1) == 0)
+               bos[h].cpu = out;
+         }
+         if (bos[h].cpu) {
+            memset((void *)(uintptr_t)bos[h].cpu, 0, (size_t)bos[h].size);
+            __asm__ volatile ("dsb sy" ::: "memory");
+            return h;
+         }
+         uint64_t in = bos[h].khandle;
+         call(SEL_FREE, &in, 1, NULL, 0);
+         st.frees++;
+         memset(&bos[h], 0, sizeof(bos[h]));
+         return 0;
+      }
+   }
+   return 0;
+}
 
 static uint32_t
 alloc_uhandle(void)
@@ -294,7 +345,7 @@ purge_evictable(uint64_t target_bytes, bool large_only)
    unsigned purged_n = 0;
    for (uint32_t h = 1; h <= MAX_BOS && evictable_bytes > target_bytes; h++) {
       struct hbo *bo = &bos[h];
-      if (!bo->in_use || !bo->evictable || bo->purged || !bo->khandle)
+      if (!bo->in_use || bo->pooled || !bo->evictable || bo->purged || !bo->khandle)
          continue;
       if (large_only && bo->size < (1024u * 1024u))
          continue;
@@ -322,7 +373,21 @@ create_bo(struct drm_panfrost_create_bo *req)
    uint64_t size = req->size;
    if (req->flags & PANFROST_BO_HEAP && size > heap_cap())
       size = heap_cap();
+   uint64_t aligned = (size + 0xfffull) & ~0xfffull;
+   if (!(req->flags & PANFROST_BO_HEAP) && aligned > 0 && aligned <= BO_POOL_ITEM_MAX) {
+      uint32_t reused = bo_pool_take(aligned);
+      if (reused) {
+         req->handle = reused;
+         req->offset = bos[reused].va;
+         req->size = (uint32_t)bos[reused].size;
+         return 0;
+      }
+   }
    uint32_t u = alloc_uhandle();
+   if (!u && bo_pool_count > 0) {
+      bo_pool_flush();
+      u = alloc_uhandle();
+   }
    if (!u) {
       herodrm_log("CREATE_BO: userspace BO handle table full");
       return fail(ENOMEM);
@@ -331,14 +396,17 @@ create_bo(struct drm_panfrost_create_bo *req)
    uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
    if (kr || out[0] == 0 || out[0] > MAX_BOS) {
+      bool flushed = bo_pool_count > 0;
+      if (flushed)
+         bo_pool_flush();
       unsigned p = purge_evictable(0, false);
       if (p == 0 && evictable_bytes > 0) {
          queue_drain();
          p = purge_evictable(0, false);
       }
-      if (p > 0) {
+      if (p > 0 || flushed) {
          kr = call(SEL_CREATE, &in, 1, out, 3);
-         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS)
+         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS && p > 0)
             herodrm_log("CREATE_BO %llu B recovered after purging %u cached BOs", (unsigned long long)size, p);
       }
    }
@@ -366,14 +434,14 @@ create_bo(struct drm_panfrost_create_bo *req)
 static struct hbo *
 lookup(uint32_t handle)
 {
-   return handle && handle <= MAX_BOS && bos[handle].in_use && !bos[handle].purged && bos[handle].va
+   return handle && handle <= MAX_BOS && bos[handle].in_use && !bos[handle].pooled && !bos[handle].purged && bos[handle].va
           ? &bos[handle] : NULL;
 }
 
 static int
 free_bo(uint32_t handle)
 {
-   if (!handle || handle > MAX_BOS || !bos[handle].in_use)
+   if (!handle || handle > MAX_BOS || !bos[handle].in_use || bos[handle].pooled)
       return fail(EINVAL);
    if (bos[handle].purged) {
       memset(&bos[handle], 0, sizeof(bos[handle]));
@@ -383,16 +451,21 @@ free_bo(uint32_t handle)
       evictable_bytes -= bos[handle].size;
       bos[handle].evictable = false;
    }
+   bool is_prime = false;
    for (int i = 0; i < MAX_PRIME; i++)
       if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
          close(primes[i].fd);
          primes[i].handle = 0;
          primes[i].surface_id = 0;
-         if (prime_bytes >= bos[handle].size)
-            prime_bytes -= bos[handle].size;
-         else
-            prime_bytes = 0;
+         is_prime = true;
       }
+   if (!is_prime && bos[handle].size <= BO_POOL_ITEM_MAX &&
+       bo_pool_count < BO_POOL_MAX && bo_pool_bytes + bos[handle].size <= BO_POOL_BYTES_MAX) {
+      bos[handle].pooled = true;
+      bo_pool[bo_pool_count++] = handle;
+      bo_pool_bytes += bos[handle].size;
+      return 0;
+   }
    bo_wait(handle);
    bo_last_job[handle] = 0;
    uint64_t in = bos[handle].khandle;
@@ -573,9 +646,50 @@ queue_worker(void *arg)
    return NULL;
 }
 
+#define ENQ_BATCH_MAX 32
+static uint64_t enq_pairs[ENQ_BATCH_MAX * 2];
+static unsigned enq_n;
+
+static void
+kfifo_flush_batch(void)
+{
+   if (!kfifo_batch_on || enq_n == 0 || !conn)
+      return;
+   __asm__ volatile ("dsb sy" ::: "memory");
+   uint64_t out[3] = {0};
+   uint32_t nout = 3;
+   uint64_t t0 = now_ns();
+   kern_return_t kr = IOConnectCallMethod(conn, SEL_ENQUEUE_BATCH, NULL, 0,
+                                          enq_pairs, enq_n * 2 * sizeof(uint64_t),
+                                          out, &nout, NULL, NULL);
+   uint64_t t1 = now_ns();
+   st.sel_calls[SEL_ENQUEUE_BATCH]++;
+   st.sel_ns[SEL_ENQUEUE_BATCH] += t1 - t0;
+   st.submit_ns += t1 - t0;
+   enq_n = 0;
+   if (kr == 0 && out[0] != 0) {
+      kfifo_seq = out[0];
+      __atomic_store_n(&kfifo_done, out[1], __ATOMIC_RELEASE);
+      if (out[2] >= kfifo_gpu_us) {
+         st.gpu_us += out[2] - kfifo_gpu_us;
+         kfifo_gpu_us = out[2];
+      }
+   }
+   stats_tick(t1);
+}
+
+EXPORT void
+herodrm_flush(void)
+{
+   pthread_mutex_lock(&lock);
+   kfifo_flush_batch();
+   pthread_mutex_unlock(&lock);
+}
+
 static void
 kfifo_wait(uint64_t seq, bool nonblock)
 {
+   kfifo_flush_batch();
    uint64_t in[2] = { seq, nonblock ? 1 : 0 }, out[2] = {0};
    if (conn && call(SEL_WAIT_SEQ, in, 2, out, 2) == 0) {
       __atomic_store_n(&kfifo_done, out[0], __ATOMIC_RELEASE);
@@ -654,18 +768,41 @@ submit(struct drm_panfrost_submit *s)
       asked = true;
       bool want_async = !(a && *a == '0');
       if (want_async) {
-         uint64_t in[2] = { 0, 1 }, out[2] = {0};
+         uint64_t in[2] = { 0, 1 }, out[3] = {0};
          if (call(SEL_WAIT_SEQ, in, 2, out, 2) == 0) {
             kfifo_on = true;
             __atomic_store_n(&kfifo_done, out[0], __ATOMIC_RELEASE);
             kfifo_gpu_us = out[1];
+            uint32_t nout = 3;
+            if (IOConnectCallMethod(conn, SEL_ENQUEUE_BATCH, NULL, 0, NULL, 0, out, &nout, NULL, NULL) == 0) {
+               kfifo_batch_on = true;
+               kfifo_seq = out[0];
+               __atomic_store_n(&kfifo_done, out[1], __ATOMIC_RELEASE);
+               kfifo_gpu_us = out[2];
+            }
          }
       }
       if (!kfifo_on)
          async_on = want_async && pthread_create(&thread, NULL, queue_worker, NULL) == 0;
       herodrm_log("submits are %s",
+                  kfifo_batch_on ? "kernel FIFO batched (0376)" :
                   kfifo_on ? "kernel FIFO (0357)" :
                   async_on ? "queued + batched (HERO_ASYNC=1)" : "synchronous (HERO_ASYNC=0)");
+   }
+   if (kfifo_batch_on) {
+      enq_pairs[2 * enq_n] = s->jc;
+      enq_pairs[2 * enq_n + 1] = js;
+      enq_n++;
+      uint64_t seq = ++kfifo_seq;
+      submits++;
+      st.submits++;
+      const uint32_t *handles = (const uint32_t *)(uintptr_t)s->bo_handles;
+      for (uint32_t i = 0; i < s->bo_handle_count; i++)
+         if (handles[i] && handles[i] <= MAX_BOS)
+            bo_last_job[handles[i]] = seq;
+      if (enq_n >= ENQ_BATCH_MAX)
+         kfifo_flush_batch();
+      return 0;
    }
    if (kfifo_on) {
       __asm__ volatile ("dsb sy" ::: "memory");
@@ -778,7 +915,7 @@ drmIoctl(int fd, unsigned long request, void *arg)
       break;
    case DRM_IOCTL_PANFROST_MADVISE: {
       struct drm_panfrost_madvise *m = arg;
-      if (!m->handle || m->handle > MAX_BOS || !bos[m->handle].in_use) {
+      if (!m->handle || m->handle > MAX_BOS || !bos[m->handle].in_use || bos[m->handle].pooled) {
          r = fail(EINVAL);
          break;
       }
@@ -884,14 +1021,12 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
 {
    int r = -1;
    pthread_mutex_lock(&lock);
-   if (prime_bytes >= MAX_PRIME_BYTES) {
-      pthread_mutex_unlock(&lock);
-      return fail(ENOENT);
-   }
    if (connect_gpu() == 0) {
       uint64_t in = surface_id, out[9] = {0};
       uint32_t kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       if (kr != 0 || !out[0] || out[0] > MAX_BOS) {
+         if (bo_pool_count > 0)
+            bo_pool_flush();
          if (purge_evictable(0, false) > 0)
             kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       }
@@ -901,14 +1036,16 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
             if (!primes[i].handle)
                slot = i;
          uint32_t u = alloc_uhandle();
-         int fd = (slot >= 0 && u != 0 && prime_bytes + out[2] <= MAX_PRIME_BYTES) ?
-                  open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
+         if (!u && bo_pool_count > 0) {
+            bo_pool_flush();
+            u = alloc_uhandle();
+         }
+         int fd = (slot >= 0 && u != 0) ? open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
          if (fd >= 0) {
             bos[u] = (struct hbo){ .khandle = (uint32_t)out[0], .va = out[1], .size = out[2], .in_use = true };
             primes[slot].fd = fd;
             primes[slot].handle = u;
             primes[slot].surface_id = surface_id;
-            prime_bytes += out[2];
             *info = (struct herodrm_surface){ .handle = u, .size = out[2],
                .bytes_per_row = (uint32_t)out[3], .width = (uint32_t)out[4], .height = (uint32_t)out[5],
                .pixel_format = (uint32_t)out[6], .offset = (uint32_t)out[7], .planes = (uint32_t)out[8] };

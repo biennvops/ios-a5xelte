@@ -31,6 +31,7 @@ extern void glGetIntegerv(unsigned name, int *value);
 extern int OSMesaSweetActive(void);
 extern int OSMesaSweetAttachDirect(unsigned name, uint32_t surface_id);
 extern void OSMesaSweetDirectSync(uint32_t surface_id);
+extern void OSMesaSweetForgetSurface(uint32_t surface_id);
 
 #define WINDOW  16
 
@@ -104,5 +105,14 @@ hakios_gl_surface_written(struct hakios_gl *gl, uint32_t surface)
 	(void)gl;
 	if (OSMesaSweetActive()) {
 		OSMesaSweetDirectSync(surface);
+	}
+}
+
+void
+hakios_gl_surface_forget(struct hakios_gl *gl, uint32_t surface)
+{
+	(void)gl;
+	if (OSMesaSweetActive()) {
+		OSMesaSweetForgetSurface(surface);
 	}
 }

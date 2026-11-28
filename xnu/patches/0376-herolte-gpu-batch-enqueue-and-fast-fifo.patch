@@ -1,0 +1,231 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 2ae9f4f..ac4e591 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -43,6 +43,7 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ uint32_t herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us);
+ uint64_t herolte_gpu_enqueue(unsigned js, uint64_t jc, uint64_t *done_out, uint64_t *gpu_us_out);
+ uint64_t herolte_gpu_wait_seq(uint64_t seq, bool nonblock, uint64_t *gpu_us_out);
++uint64_t herolte_gpu_enqueue_batch(const uint64_t *pairs, unsigned count, uint64_t *done_out, uint64_t *gpu_us_out);
+ uint64_t herolte_gpu_tail_seq(void);
+ void herolte_gpu_wait_present(uint64_t seq);
+ 
+@@ -366,7 +367,8 @@ static uint32_t hg_affinity = 1;
+  * 0: before and after every job, as Linux's panfrost. 1 (default): only after, as a job begun finds it clean already.
+  * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
+  */
+-static uint32_t hg_flush_mode = 1;
++static uint32_t hg_flush_mode = 2;
++static uint32_t hg_shader_mask;
+ /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
+ static uint64_t hg_job_va = HG_TEST_VA;
+ static vm_offset_t hg_job_cpu;
+@@ -929,21 +931,29 @@ hg_run(unsigned js, const char *what)
+ 		}
+ 		unsigned nap = (hg_run_nap && hg_sleep_us >= 10 && hg_sleep_us <= 5000) ? hg_sleep_us : 0;
+ 		unsigned waited_us = 0;
++		const uint32_t jmask = (1u << js) | (1u << (js + 16));
+ 		while (waited_us < 200000) {
+ 			jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
+-			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
+-			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
+-			if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
++			if (jirq & jmask) {
+ 				break;
+ 			}
+ 			if (nap && waited_us >= (unsigned)spin_us) {
++				mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++				girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++				if (mirq || (girq & 0x81)) {
++					break;
++				}
+ 				hg_usleep(nap);
+ 				waited_us += nap;
+ 			} else {
+-				delay(2);
+-				waited_us += 2;
++				delay(1);
++				waited_us += 1;
+ 			}
+ 		}
++		if (!(jirq & (1u << js)) || (jirq & (1u << (js + 16)))) {
++			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++		}
+ 	}
+ 	volatile uint32_t *hdr = (volatile uint32_t *)(hg_job_cpu ? hg_job_cpu : hg_mem + HG_DATA_OFF);
+ 	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
+@@ -1665,6 +1675,7 @@ hg_bringup(void)
+ 	l1[HGU_VA_BASE >> 30] = (HG_SCR_PA + HGU_L2_OFF) | 3;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	hg_up_state = 1;
++	hg_shader_mask = all;
+ 	printf("HEROLTE GPU: up, cores %#x, user VA %#llx..%#llx, %u L3 tables\n", all,
+ 	    HGU_VA_BASE, HGU_VA_END, HGU_L3_MAX);
+ 	return true;
+@@ -2746,35 +2757,100 @@ hg_worker_thread(__unused void *arg, __unused wait_result_t wr)
+ 		while (hg_q_done == hg_q_tail) {
+ 			(void)lck_mtx_sleep(hg_q_mtx, LCK_SLEEP_DEFAULT, (event_t)&hg_q_work_ev, THREAD_UNINT);
+ 		}
+-		uint64_t jc = hg_q[hg_q_done % HG_Q_SIZE].jc;
+-		unsigned js = hg_q[hg_q_done % HG_Q_SIZE].js;
+ 		lck_mtx_unlock(hg_q_mtx);
+ 
+-		uint64_t dt = 0;
++		/* Hold hg_mtx across consecutive queued jobs to avoid per-job mutex bounce. */
+ 		lck_mtx_lock(hg_mtx);
+-		if (hg_up_state == 1 && jc != 0) {
+-			uint64_t start = mach_absolute_time();
+-			hg_affinity = hg_rd(hg_gpu, SHADER_PRESENT_LO);
+-			hg_job_va = jc;
+-			hg_job_cpu = 0;
+-			hg_run_quiet = true;
+-			hg_run_nap = true;
+-			(void)hg_run(js, js ? "HEROGPU fifo JS1" : "HEROGPU fifo JS0");
+-			hg_run_nap = false;
+-			hg_run_quiet = false;
+-			hg_job_va = HG_TEST_VA;
+-			hg_affinity = 1;
+-			dt = hg_us_since(start);
++		for (unsigned burst = 0; burst < 32; burst++) {
++			lck_mtx_lock(hg_q_mtx);
++			if (hg_q_done == hg_q_tail) {
++				lck_mtx_unlock(hg_q_mtx);
++				break;
++			}
++			uint64_t jc = hg_q[hg_q_done % HG_Q_SIZE].jc;
++			unsigned js = hg_q[hg_q_done % HG_Q_SIZE].js;
++			lck_mtx_unlock(hg_q_mtx);
++
++			uint64_t dt = 0;
++			if (hg_up_state == 1 && jc != 0) {
++				uint64_t start = mach_absolute_time();
++				hg_affinity = hg_shader_mask ? hg_shader_mask : hg_rd(hg_gpu, SHADER_PRESENT_LO);
++				hg_job_va = jc;
++				hg_job_cpu = 0;
++				hg_run_quiet = true;
++				hg_run_nap = true;
++				(void)hg_run(js, js ? "HEROGPU fifo JS1" : "HEROGPU fifo JS0");
++				hg_run_nap = false;
++				hg_run_quiet = false;
++				hg_job_va = HG_TEST_VA;
++				hg_affinity = 1;
++				dt = hg_us_since(start);
++			}
++
++			lck_mtx_lock(hg_q_mtx);
++			hg_q_done++;
++			hg_q_gpu_us += dt;
++			thread_wakeup((event_t)&hg_q_done_ev);
++			lck_mtx_unlock(hg_q_mtx);
+ 		}
+ 		lck_mtx_unlock(hg_mtx);
+ 
+ 		lck_mtx_lock(hg_q_mtx);
+-		hg_q_done++;
+-		hg_q_gpu_us += dt;
+-		thread_wakeup((event_t)&hg_q_done_ev);
+ 	}
+ }
+ 
++uint64_t
++herolte_gpu_enqueue_batch(const uint64_t *pairs, unsigned count, uint64_t *done_out, uint64_t *gpu_us_out)
++{
++	if (count > 64) {
++		return 0;
++	}
++	if (count > 0) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	lck_mtx_lock(hg_q_mtx);
++	if (count > 0 && !hg_q_started) {
++		thread_t th = THREAD_NULL;
++		if (kernel_thread_start(hg_worker_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++			__atomic_store_n(&hg_q_started, true, __ATOMIC_RELEASE);
++			printf("HEROLTE GPU: kernel FIFO worker started (%u slots, batch)
++", HG_Q_SIZE);
++		} else {
++			lck_mtx_unlock(hg_q_mtx);
++			return 0;
++		}
++	}
++	uint64_t seq = hg_q_tail;
++	for (unsigned i = 0; i < count; i++) {
++		uint64_t jc = pairs[2 * i];
++		unsigned js = pairs[2 * i + 1] ? 1u : 0u;
++		if (jc == 0) {
++			continue;
++		}
++		while (hg_q_tail - hg_q_done >= HG_Q_SIZE) {
++			(void)lck_mtx_sleep(hg_q_mtx, LCK_SLEEP_DEFAULT, (event_t)&hg_q_done_ev, THREAD_UNINT);
++		}
++		hg_q[hg_q_tail % HG_Q_SIZE].jc = jc;
++		hg_q[hg_q_tail % HG_Q_SIZE].js = (uint8_t)js;
++		seq = hg_q_tail + 1;
++		__atomic_store_n(&hg_q_tail, seq, __ATOMIC_RELEASE);
++	}
++	uint64_t done = hg_q_done;
++	uint64_t tus = hg_q_gpu_us;
++	if (count > 0) {
++		thread_wakeup((event_t)&hg_q_work_ev);
++	}
++	lck_mtx_unlock(hg_q_mtx);
++	if (done_out) {
++		*done_out = done;
++	}
++	if (gpu_us_out) {
++		*gpu_us_out = tus;
++	}
++	return seq;
++}
++
+ uint64_t
+ herolte_gpu_enqueue(unsigned js, uint64_t jc, uint64_t *done_out, uint64_t *gpu_us_out)
+ {
+diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
+index 67f45af..c90d2ec 100644
+--- a/iokit/Kernel/arm/HeroGPU.cpp
++++ b/iokit/Kernel/arm/HeroGPU.cpp
+@@ -50,6 +50,7 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ uint32_t herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us);
+ uint64_t herolte_gpu_enqueue(unsigned js, uint64_t jc, uint64_t *done_out, uint64_t *gpu_us_out);
+ uint64_t herolte_gpu_wait_seq(uint64_t seq, bool nonblock, uint64_t *gpu_us_out);
++uint64_t herolte_gpu_enqueue_batch(const uint64_t *pairs, unsigned count, uint64_t *done_out, uint64_t *gpu_us_out);
+ }
+ 
+ enum {
+@@ -64,6 +65,7 @@ enum {
+ 	kHeroGPUSubmitBatch = 8,
+ 	kHeroGPUEnqueue     = 9,
+ 	kHeroGPUWaitSeq     = 10,
++	kHeroGPUEnqueueBatch = 11,
+ };
+ 
+ #define HEROGPU_MAX_BOS         4096
+@@ -481,6 +483,25 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		outCount = 2;
+ 		break;
+ 	}
++	case kHeroGPUEnqueueBatch: {
++		uint32_t n = args->structureInputSize / 16u;
++		if (n > 64 || (args->structureInputSize & 15u) != 0 || (n > 0 && args->structureInput == NULL)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint64_t pairs[128];
++		if (n > 0) {
++			memcpy(pairs, args->structureInput, n * 16u);
++		}
++		IOLockUnlock(fLock);
++		out[0] = herolte_gpu_enqueue_batch(pairs, n, &out[1], &out[2]);
++		IOLockLock(fLock);
++		if (n > 0 && out[0] == 0) {
++			ret = kIOReturnError;
++		}
++		outCount = 3;
++		break;
++	}
+ 	case kHeroGPUSurfaceBO: {
+ 		unsigned i = 0;
+ 		while (i < HEROGPU_MAX_BOS && herogpu_bo_used(&fBOs[i])) {
