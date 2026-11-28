@@ -79,6 +79,7 @@ static uint64_t submits, faults;
 static struct {
    uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
    uint64_t sel_calls[12], sel_ns[12];  /* (2026-11-14) every kernel call, by selector: where mach_msg2_trap's time goes */
+   uint64_t w_calls[4], w_ns[4];        /* 0: bo_blk, 1: bo_poll, 2: syncobj, 3: bosync */
 } st;
 static const char *const sel_names[12] = { "param", "create", "free", "map", "submit", "log", "surfacebo", "syncbo", "batch", "enq", "wait", "enqb" };
 
@@ -115,6 +116,13 @@ stats_tick(uint64_t t)
    }
    if (used)
       herodrm_log("kernel calls %.1f s:%s", wall / 1e9, by);
+   if (st.w_calls[0] || st.w_calls[2] || st.w_calls[3])
+      herodrm_log("waits %.1f s: bo_blk %llu/%.1fms bo_poll %llu/%.1fms syncobj %llu/%.1fms bosync %llu/%.1fms",
+                  wall / 1e9,
+                  (unsigned long long)st.w_calls[0], st.w_ns[0] / 1e6,
+                  (unsigned long long)st.w_calls[1], st.w_ns[1] / 1e6,
+                  (unsigned long long)st.w_calls[2], st.w_ns[2] / 1e6,
+                  (unsigned long long)st.w_calls[3], st.w_ns[3] / 1e6);
    memset(&st, 0, sizeof(st));
    st.start_ns = t;
 }
@@ -619,6 +627,7 @@ queue_worker(void *arg)
 static uint64_t enq_pairs[ENQ_BATCH_MAX * 2];
 static unsigned enq_n;
 static uint32_t enq_bos[512];
+static uint8_t  enq_bo_job[MAX_BOS + 1]; /* index 0..enq_n-1 of last job in current batch touching handle */
 static unsigned enq_nbos;
 
 static void
@@ -629,9 +638,10 @@ kfifo_flush_batch(void)
    __asm__ volatile ("dsb sy" ::: "memory");
    uint64_t out[3] = {0};
    uint32_t nout = 3;
+   unsigned batch_n = enq_n;
    uint64_t t0 = now_ns();
    kern_return_t kr = IOConnectCallMethod(conn, SEL_ENQUEUE_BATCH, NULL, 0,
-                                          enq_pairs, enq_n * 2 * sizeof(uint64_t),
+                                          enq_pairs, batch_n * 2 * sizeof(uint64_t),
                                           out, &nout, NULL, NULL);
    uint64_t t1 = now_ns();
    st.sel_calls[SEL_ENQUEUE_BATCH]++;
@@ -639,6 +649,7 @@ kfifo_flush_batch(void)
    st.submit_ns += t1 - t0;
    enq_n = 0;
    uint64_t real_seq = (kr == 0 && out[0] != 0) ? out[0] : kfifo_seq;
+   uint64_t base_seq = real_seq >= batch_n ? (real_seq - batch_n + 1) : 1;
    if (kr == 0 && out[0] != 0) {
       kfifo_seq = out[0];
       __atomic_store_n(&kfifo_done, out[1], __ATOMIC_RELEASE);
@@ -651,7 +662,7 @@ kfifo_flush_batch(void)
    for (unsigned i = 0; i < enq_nbos; i++) {
       uint32_t h = enq_bos[i];
       if (h && h <= MAX_BOS && bo_last_job[h] == ENQ_BO_PENDING)
-         bo_last_job[h] = real_seq;
+         bo_last_job[h] = base_seq + enq_bo_job[h];
    }
    enq_nbos = 0;
    for (unsigned i = 0; i < defer_free_n; i++) {
@@ -717,8 +728,12 @@ bo_busy(uint32_t handle)
       if (need <= __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
          return false;
       /* Rate-limit non-blocking kernel polls during Mesa's BO cache scans (once per 200 us). */
-      if (now_ns() - kfifo_poll_ns >= 200000ull)
+      uint64_t now = now_ns();
+      if (now - kfifo_poll_ns >= 200000ull) {
          kfifo_wait(0, true);
+         st.w_calls[1]++;
+         st.w_ns[1] += now_ns() - now;
+      }
       return need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE);
    }
    if (!async_on)
@@ -740,8 +755,12 @@ bo_wait(uint32_t handle)
          kfifo_flush_batch();
          need = bo_last_job[handle];
       }
-      if (need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
+      if (need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE)) {
+         uint64_t t0 = now_ns();
          kfifo_wait(need == ENQ_BO_PENDING ? 0 : need, false);
+         st.w_calls[0]++;
+         st.w_ns[0] += now_ns() - t0;
+      }
       return;
    }
    if (!async_on)
@@ -789,6 +808,7 @@ submit(struct drm_panfrost_submit *s)
    if (kfifo_batch_on) {
       if (s->jc == 0)
          return 0;
+      uint8_t job_idx = (uint8_t)enq_n;
       enq_pairs[2 * enq_n] = s->jc;
       enq_pairs[2 * enq_n + 1] = js;
       enq_n++;
@@ -803,6 +823,7 @@ submit(struct drm_panfrost_submit *s)
                   enq_bos[enq_nbos++] = h;
                bo_last_job[h] = ENQ_BO_PENDING;
             }
+            enq_bo_job[h] = job_idx;
          }
       }
       if (enq_n >= ENQ_BATCH_MAX || enq_nbos >= 480)
@@ -1073,7 +1094,10 @@ EXPORT int
 herodrm_bo_sync(uint32_t handle)
 {
    pthread_mutex_lock(&lock);
+   uint64_t t0 = now_ns();
    queue_drain();
+   st.w_calls[3]++;
+   st.w_ns[3] += now_ns() - t0;
    struct hbo *bo = lookup(handle);
    uint64_t in = bo ? bo->khandle : 0;
    uint32_t kr = (conn && in) ? call(SEL_SYNC_BO, &in, 1, NULL, 0) : 1;
@@ -1205,7 +1229,10 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_
          return 0;
       }
    }
+   uint64_t t0 = now_ns();
    queue_drain();
+   st.w_calls[2]++;
+   st.w_ns[2] += now_ns() - t0;
    pthread_mutex_unlock(&lock);
    if (first_signaled)
       *first_signaled = 0;
