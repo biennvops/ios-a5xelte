@@ -1,0 +1,308 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index a5cf918..bf26b2d 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -367,7 +367,8 @@ static uint32_t hg_affinity = 1;
+  * 0: before and after every job, as Linux's panfrost. 1 (default): only after, as a job begun finds it clean already.
+  * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
+  */
+-static uint32_t hg_flush_mode = 1;
++static uint32_t hg_flush_mode = 3;      /* 3: JS1 END_FLUSH_CLEAN + HW flush reduction (1 = full clean+inv) */
++static uint32_t hg_pipe_on = 1;         /* 0378: overlap JS0(k) fragment with JS1(k+1) vertex/tiler on Mali-T880 */
+ static uint32_t hg_shader_mask;
+ /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
+ static uint64_t hg_job_va = HG_TEST_VA;
+@@ -916,8 +917,13 @@ hg_run(unsigned js, const char *what)
+ 	hg_wr(hg_gpu, slot + 0x50, hg_affinity);                /* AFFINITY */
+ 	hg_wr(hg_gpu, slot + 0x54, 0);
+ 	uint32_t flush_start = (hg_run_quiet && hg_flush_mode >= 1) ? 0 : (3u << 8);
+-	uint32_t flush_end = (hg_run_quiet && hg_flush_mode >= 2 && js == 1) ? 0 : (3u << 12);
+-	hg_wr(hg_gpu, slot + 0x58, (8u << 16) | flush_start | flush_end);
++	uint32_t flush_end = (hg_run_quiet && hg_flush_mode == 2 && js == 1) ? 0 :
++	    (hg_run_quiet && hg_flush_mode >= 3 && js == 1) ? (1u << 12) : (3u << 12);
++	uint32_t flush_red = (hg_run_quiet && hg_flush_mode >= 3) ? (1u << 14) : 0;
++	if (flush_red) {
++		hg_wr(hg_gpu, slot + 0x70, hg_rd(hg_gpu, 0x38)); /* JS_FLUSH_ID_NEXT = GPU_LATEST_FLUSH_ID */
++	}
++	hg_wr(hg_gpu, slot + 0x58, (8u << 16) | flush_start | flush_end | flush_red);
+ 	hg_wr(hg_gpu, slot + 0x60, 1);                          /* START */
+ 
+ 	uint32_t jirq = 0, mirq = 0, girq = 0;
+@@ -1681,6 +1687,7 @@ hg_bringup(void)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	hg_up_state = 1;
+ 	hg_shader_mask = all;
++	PE_parse_boot_argn("herogpu_pipe", &hg_pipe_on, sizeof(hg_pipe_on));
+ 	printf("HEROLTE GPU: up, cores %#x, user VA %#llx..%#llx, %u L3 tables\n", all,
+ 	    HGU_VA_BASE, HGU_VA_END, HGU_L3_MAX);
+ 	return true;
+@@ -2765,6 +2772,91 @@ herolte_gpu_submit_batch(const uint64_t *pairs, unsigned count, uint64_t *us)
+ 	return status;
+ }
+ 
++/*
++ * (0378) Run JS0(k) (fragment) and JS1(k+1) (vertex/tiler of next batch) concurrently on Mali-T880's
++ * two independent hardware job slots. Called with hg_mtx held and hg_up_state == 1.
++ */
++static void
++hg_run_pair(uint64_t jc0, uint64_t jc1)
++{
++	uint32_t aff = hg_shader_mask ? hg_shader_mask : hg_rd(hg_gpu, SHADER_PRESENT_LO);
++	if (!hg_as_ok) {
++		hg_affinity = aff;
++		hg_job_va = jc0;
++		hg_job_cpu = 0;
++		hg_run_quiet = true;
++		hg_run_nap = true;
++		(void)hg_run(0, "HEROGPU fifo JS0");
++		hg_job_va = jc1;
++		(void)hg_run(1, "HEROGPU fifo JS1");
++		hg_run_nap = false;
++		hg_run_quiet = false;
++		hg_job_va = HG_TEST_VA;
++		hg_affinity = 1;
++		return;
++	}
++	hgu_flush_if_dirty_locked();
++	hg_wr(hg_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	hg_wr(hg_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	uint32_t flush_start = (hg_flush_mode >= 1) ? 0 : (3u << 8);
++	uint32_t flush_red = (hg_flush_mode >= 3) ? (1u << 14) : 0;
++	uint32_t flush_id = flush_red ? hg_rd(hg_gpu, 0x38) : 0;
++	uint32_t cfg0 = (8u << 16) | flush_start | (3u << 12) | flush_red;
++	uint32_t cfg1 = (8u << 16) | flush_start | ((hg_flush_mode >= 3) ? (1u << 12) : (3u << 12)) | flush_red;
++
++	uint32_t s0 = JS_BASE(0), s1 = JS_BASE(1);
++	hg_wr(hg_gpu, s0 + 0x40, (uint32_t)jc0);
++	hg_wr(hg_gpu, s0 + 0x44, (uint32_t)(jc0 >> 32));
++	hg_wr(hg_gpu, s0 + 0x50, aff);
++	hg_wr(hg_gpu, s0 + 0x54, 0);
++	if (flush_red) { hg_wr(hg_gpu, s0 + 0x70, flush_id); }
++	hg_wr(hg_gpu, s0 + 0x58, cfg0);
++
++	hg_wr(hg_gpu, s1 + 0x40, (uint32_t)jc1);
++	hg_wr(hg_gpu, s1 + 0x44, (uint32_t)(jc1 >> 32));
++	hg_wr(hg_gpu, s1 + 0x50, aff);
++	hg_wr(hg_gpu, s1 + 0x54, 0);
++	if (flush_red) { hg_wr(hg_gpu, s1 + 0x70, flush_id); }
++	hg_wr(hg_gpu, s1 + 0x58, cfg1);
++
++	/* Kick both hardware slots together! */
++	hg_wr(hg_gpu, s0 + 0x60, 1);
++	hg_wr(hg_gpu, s1 + 0x60, 1);
++
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	unsigned waited_us = 0;
++	const uint32_t done_both = (1u << 0) | (1u << 1);
++	const uint32_t fail_any = (1u << 16) | (1u << 17);
++	while (waited_us < 200000) {
++		jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
++		if (((jirq & done_both) == done_both) || (jirq & fail_any)) {
++			break;
++		}
++		if (waited_us >= 500 && hg_sleep_us >= 10 && hg_sleep_us <= 5000) {
++			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++			if (mirq || (girq & 0x81)) {
++				break;
++			}
++			hg_usleep(hg_sleep_us);
++			waited_us += hg_sleep_us;
++		} else {
++			delay(1);
++			waited_us += 1;
++		}
++	}
++	if ((jirq & done_both) != done_both || (jirq & fail_any)) {
++		mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++		girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++		printf("HEROLTE GPU: pair fault jirq=%#x mirq=%#x girq=%#x st0=%#x st1=%#x\n",
++		    jirq, mirq, girq, hg_rd(hg_gpu, s0 + 0x24), hg_rd(hg_gpu, s1 + 0x24));
++		hg_recover("HEROGPU pair");
++	}
++	hg_wr(hg_gpu, JOB_IRQ_CLEAR, jirq);
++}
++
+ static void
+ hg_worker_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -2775,7 +2867,6 @@ hg_worker_thread(__unused void *arg, __unused wait_result_t wr)
+ 		}
+ 		lck_mtx_unlock(hg_q_mtx);
+ 
+-		/* Hold hg_mtx across consecutive queued jobs to avoid per-job mutex bounce. */
+ 		lck_mtx_lock(hg_mtx);
+ 		for (unsigned burst = 0; burst < 8; burst++) {
+ 			lck_mtx_lock(hg_q_mtx);
+@@ -2785,26 +2876,38 @@ hg_worker_thread(__unused void *arg, __unused wait_result_t wr)
+ 			}
+ 			uint64_t jc = hg_q[hg_q_done % HG_Q_SIZE].jc;
+ 			unsigned js = hg_q[hg_q_done % HG_Q_SIZE].js;
++			uint64_t jc_next = 0;
++			bool paired = false;
++			if (hg_pipe_on && js == 0 && (hg_q_done + 1) < hg_q_tail &&
++			    hg_q[(hg_q_done + 1) % HG_Q_SIZE].js == 1 &&
++			    hg_q[(hg_q_done + 1) % HG_Q_SIZE].jc != 0) {
++				jc_next = hg_q[(hg_q_done + 1) % HG_Q_SIZE].jc;
++				paired = true;
++			}
+ 			lck_mtx_unlock(hg_q_mtx);
+ 
+ 			uint64_t dt = 0;
+ 			if (hg_up_state == 1 && jc != 0) {
+ 				uint64_t start = mach_absolute_time();
+-				hg_affinity = hg_shader_mask ? hg_shader_mask : hg_rd(hg_gpu, SHADER_PRESENT_LO);
+-				hg_job_va = jc;
+-				hg_job_cpu = 0;
+-				hg_run_quiet = true;
+-				hg_run_nap = true;
+-				(void)hg_run(js, js ? "HEROGPU fifo JS1" : "HEROGPU fifo JS0");
+-				hg_run_nap = false;
+-				hg_run_quiet = false;
+-				hg_job_va = HG_TEST_VA;
+-				hg_affinity = 1;
++				if (paired) {
++					hg_run_pair(jc, jc_next);
++				} else {
++					hg_affinity = hg_shader_mask ? hg_shader_mask : hg_rd(hg_gpu, SHADER_PRESENT_LO);
++					hg_job_va = jc;
++					hg_job_cpu = 0;
++					hg_run_quiet = true;
++					hg_run_nap = true;
++					(void)hg_run(js, js ? "HEROGPU fifo JS1" : "HEROGPU fifo JS0");
++					hg_run_nap = false;
++					hg_run_quiet = false;
++					hg_job_va = HG_TEST_VA;
++					hg_affinity = 1;
++				}
+ 				dt = hg_us_since(start);
+ 			}
+ 
+ 			lck_mtx_lock(hg_q_mtx);
+-			hg_q_done++;
++			hg_q_done += paired ? 2u : 1u;
+ 			hg_q_gpu_us += dt;
+ 			thread_wakeup((event_t)&hg_q_done_ev);
+ 			lck_mtx_unlock(hg_q_mtx);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9be5638..89b0ddf 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -209,6 +209,9 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void showFired(OSObject *owner, IOTimerEventSource *sender);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	static void presentThread(void *arg, wait_result_t wr);
++#endif
+ 
+ public:
+ 	IOTimerEventSource *fShow;      /* a frame goes to the panel as soon as it is given (boot-arg sweetfb_tick=1: at the next tick) */
+@@ -232,6 +235,9 @@ public:
+ 	uint64_t      fSwapSeq, fPendingSeq, fShownSeq;     /* (0425) swaps given, the pending one, the last one shown */
+ 	uint64_t      fPendingGpuSeq;                       /* (0359) kernel GPU FIFO tail at SwapEnd */
+ 	bool          fDirty;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	bool          fPresentAsync;
++#endif
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	bool          fPerfLog;       /* A5-only copy timing; never on the donor */
+@@ -511,6 +517,16 @@ AppleCLCD::start(IOService *provider)
+ 		int no_sync = 0;
+ 		PE_parse_boot_argn("sweetfb_nosync", &no_sync, sizeof(no_sync));
+ 		fDecon = no_sync ? 0 : ml_io_map(0x13960000u, 0x1000);
++		uint32_t async_p = 1;
++		PE_parse_boot_argn("sweetfb_async", &async_p, sizeof(async_p));
++		if (async_p) {
++			thread_t pth = THREAD_NULL;
++			if (kernel_thread_start(&AppleCLCD::presentThread, this, &pth) == KERN_SUCCESS) {
++				thread_deallocate(pth);
++				fPresentAsync = true;
++				IOLog("HEROLTE FB: dedicated present thread started (off fWorkLoop)\n");
++			}
++		}
+ #endif
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+@@ -757,6 +773,56 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++void
++AppleCLCD::presentThread(void *arg, __unused wait_result_t wr)
++{
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return;
++	}
++	for (;;) {
++		IOLockLock(fb->fLock);
++		while (!fb->fDirty || fb->fPowerOff) {
++			IOLockSleep(fb->fLock, &fb->fDirty, THREAD_UNINT);
++		}
++		uint64_t now = mach_absolute_time();
++		if (now < sweet_fb_hold_until) {
++			IOLockUnlock(fb->fLock);
++			IOSleep(2);
++			continue;
++		}
++		memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		uint64_t seq = fb->fPendingSeq;
++		uint64_t gpu_seq = fb->fPendingGpuSeq;
++		fb->fDirty = false;
++		IOLockUnlock(fb->fLock);
++
++		uint64_t before = mach_absolute_time();
++		herolte_gpu_wait_present(gpu_seq);
++		uint64_t bytes = fb->present(rec);
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - before, &ns);
++
++		IOLockLock(fb->fLock);
++		uint64_t vc = __atomic_load_n(&fb->fVsyncCount, __ATOMIC_ACQUIRE);
++		uint64_t gap = vc - fb->fLastShown;
++		fb->fGaps[gap <= 1 ? 0 : gap >= 4 ? 3 : gap - 1] += gap <= 30 ? 1 : 0;
++		fb->fLastShown = vc;
++		fb->fShownSeq = seq;
++		fb->fPerfFrames++;
++		fb->fPerfBytes += bytes;
++		fb->fPerfNS += ns;
++		if (ns > fb->fPerfMaxNS) {
++			fb->fPerfMaxNS = ns;
++		}
++		IOLockWakeup(fb->fLock, &fb->fShownSeq, false);
++		IOLockUnlock(fb->fLock);
++	}
++}
++#endif
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -1036,10 +1102,21 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fSwaps++;
+ 	fOverwritten += fDirty ? 1 : 0;
+ 	fDirty = true;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	bool async_p = fPresentAsync;
++	if (async_p) {
++		IOLockWakeup(fLock, &fDirty, false);
++	}
++	IOLockUnlock(fLock);
++	if (!async_p && fShow != NULL) {
++		fShow->setTimeoutUS(1);
++	}
++#else
+ 	IOLockUnlock(fLock);
+ 	if (fShow != NULL) {
+ 		fShow->setTimeoutUS(1);
+ 	}
++#endif
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* Raw record of the first swaps: offset=value of every non-zero word. */
+ 	if (sweet_fb_swap_count < 8) {
