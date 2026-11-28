@@ -68,6 +68,8 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static io_connect_t conn;
 static struct hbo bos[MAX_BOS + 1];     /* indexed by userspace handle (khandle = kernel handle, 0 if purged) */
 static uint64_t evictable_bytes;
+static uint64_t prime_bytes;
+#define MAX_PRIME_BYTES (160ull * 1024ull * 1024ull) /* keep permanent hero_hw imports well below 1 GiB Mali user VA */
 #define MAX_PRIME 256
 static struct { int fd; uint32_t handle; uint32_t surface_id; } primes[MAX_PRIME];  /* imported surfaces' stand-in descriptors */
 static int debug = -1;
@@ -386,6 +388,10 @@ free_bo(uint32_t handle)
          close(primes[i].fd);
          primes[i].handle = 0;
          primes[i].surface_id = 0;
+         if (prime_bytes >= bos[handle].size)
+            prime_bytes -= bos[handle].size;
+         else
+            prime_bytes = 0;
       }
    bo_wait(handle);
    bo_last_job[handle] = 0;
@@ -878,6 +884,10 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
 {
    int r = -1;
    pthread_mutex_lock(&lock);
+   if (prime_bytes >= MAX_PRIME_BYTES) {
+      pthread_mutex_unlock(&lock);
+      return fail(ENOENT);
+   }
    if (connect_gpu() == 0) {
       uint64_t in = surface_id, out[9] = {0};
       uint32_t kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
@@ -891,12 +901,14 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
             if (!primes[i].handle)
                slot = i;
          uint32_t u = alloc_uhandle();
-         int fd = (slot >= 0 && u != 0) ? open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
+         int fd = (slot >= 0 && u != 0 && prime_bytes + out[2] <= MAX_PRIME_BYTES) ?
+                  open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
          if (fd >= 0) {
             bos[u] = (struct hbo){ .khandle = (uint32_t)out[0], .va = out[1], .size = out[2], .in_use = true };
             primes[slot].fd = fd;
             primes[slot].handle = u;
             primes[slot].surface_id = surface_id;
+            prime_bytes += out[2];
             *info = (struct herodrm_surface){ .handle = u, .size = out[2],
                .bytes_per_row = (uint32_t)out[3], .width = (uint32_t)out[4], .height = (uint32_t)out[5],
                .pixel_format = (uint32_t)out[6], .offset = (uint32_t)out[7], .planes = (uint32_t)out[8] };
