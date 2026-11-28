@@ -261,12 +261,41 @@ heap_cap(void)
 }
 
 static bool async_on, kfifo_on, kfifo_batch_on;
-static uint64_t kfifo_done, kfifo_gpu_us, kfifo_seq;
+static uint64_t kfifo_done, kfifo_gpu_us, kfifo_seq, kfifo_poll_ns;
 static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
 static void queue_drain(void);
 static void kfifo_flush_batch(void);
 static bool bo_busy(uint32_t handle);
 static void bo_wait(uint32_t handle);
+
+#define ENQ_BO_PENDING (~0ull)
+#define DEFER_FREE_MAX 256
+static struct { uint32_t khandle; uint64_t need_seq; } defer_free[DEFER_FREE_MAX];
+static unsigned defer_free_n;
+
+static unsigned
+defer_free_reap(bool force_all)
+{
+   unsigned freed = 0;
+   if (defer_free_n == 0)
+      return 0;
+   if (force_all)
+      queue_drain();
+   uint64_t done = __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE);
+   unsigned w = 0;
+   for (unsigned i = 0; i < defer_free_n; i++) {
+      if (force_all || (defer_free[i].need_seq != ENQ_BO_PENDING && defer_free[i].need_seq <= done)) {
+         uint64_t in = defer_free[i].khandle;
+         call(SEL_FREE, &in, 1, NULL, 0);
+         st.frees++;
+         freed++;
+      } else {
+         defer_free[w++] = defer_free[i];
+      }
+   }
+   defer_free_n = w;
+   return freed;
+}
 
 static uint32_t
 alloc_uhandle(void)
@@ -330,15 +359,17 @@ create_bo(struct drm_panfrost_create_bo *req)
    uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
    if (kr || out[0] == 0 || out[0] > MAX_BOS) {
+      unsigned df = defer_free_reap(false);
       unsigned p = purge_evictable(0, false);
-      if (p == 0 && evictable_bytes > 0) {
-         queue_drain();
-         p = purge_evictable(0, false);
+      if (df == 0 && p == 0 && (defer_free_n > 0 || evictable_bytes > 0)) {
+         df += defer_free_reap(true);
+         p += purge_evictable(0, false);
       }
-      if (p > 0) {
+      if (df > 0 || p > 0) {
          kr = call(SEL_CREATE, &in, 1, out, 3);
-         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS)
-            herodrm_log("CREATE_BO %llu B recovered after purging %u cached BOs", (unsigned long long)size, p);
+         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS && p > 0)
+            herodrm_log("CREATE_BO %llu B recovered after purging %u cached BOs (%u deferred)",
+                        (unsigned long long)size, p, df);
       }
    }
    uint64_t t1 = now_ns();
@@ -388,6 +419,22 @@ free_bo(uint32_t handle)
          primes[i].handle = 0;
          primes[i].surface_id = 0;
       }
+   if (kfifo_on && bo_last_job[handle] != 0) {
+      uint64_t need = bo_last_job[handle];
+      if (need == ENQ_BO_PENDING || need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE)) {
+         if (defer_free_n >= DEFER_FREE_MAX)
+            defer_free_reap(false);
+         if (defer_free_n < DEFER_FREE_MAX) {
+            defer_free[defer_free_n].khandle = bos[handle].khandle;
+            defer_free[defer_free_n].need_seq = need;
+            defer_free_n++;
+            bo_last_job[handle] = 0;
+            memset(&bos[handle], 0, sizeof(bos[handle]));
+            DBG("FREE_BO %u (deferred)", handle);
+            return 0;
+         }
+      }
+   }
    bo_wait(handle);
    bo_last_job[handle] = 0;
    uint64_t in = bos[handle].khandle;
@@ -569,7 +616,6 @@ queue_worker(void *arg)
 }
 
 #define ENQ_BATCH_MAX 32
-#define ENQ_BO_PENDING (~0ull)
 static uint64_t enq_pairs[ENQ_BATCH_MAX * 2];
 static unsigned enq_n;
 static uint32_t enq_bos[512];
@@ -596,6 +642,7 @@ kfifo_flush_batch(void)
    if (kr == 0 && out[0] != 0) {
       kfifo_seq = out[0];
       __atomic_store_n(&kfifo_done, out[1], __ATOMIC_RELEASE);
+      kfifo_poll_ns = t1;
       if (out[2] >= kfifo_gpu_us) {
          st.gpu_us += out[2] - kfifo_gpu_us;
          kfifo_gpu_us = out[2];
@@ -607,6 +654,11 @@ kfifo_flush_batch(void)
          bo_last_job[h] = real_seq;
    }
    enq_nbos = 0;
+   for (unsigned i = 0; i < defer_free_n; i++) {
+      if (defer_free[i].need_seq == ENQ_BO_PENDING)
+         defer_free[i].need_seq = real_seq;
+   }
+   defer_free_reap(false);
    stats_tick(t1);
 }
 
@@ -615,6 +667,7 @@ herodrm_flush(void)
 {
    pthread_mutex_lock(&lock);
    kfifo_flush_batch();
+   defer_free_reap(false);
    pthread_mutex_unlock(&lock);
 }
 
@@ -625,6 +678,7 @@ kfifo_wait(uint64_t seq, bool nonblock)
    uint64_t in[2] = { seq, nonblock ? 1 : 0 }, out[2] = {0};
    if (conn && call(SEL_WAIT_SEQ, in, 2, out, 2) == 0) {
       __atomic_store_n(&kfifo_done, out[0], __ATOMIC_RELEASE);
+      kfifo_poll_ns = now_ns();
       if (out[1] >= kfifo_gpu_us) {
          st.gpu_us += out[1] - kfifo_gpu_us;
          kfifo_gpu_us = out[1];
@@ -657,13 +711,14 @@ bo_busy(uint32_t handle)
       uint64_t need = bo_last_job[handle];
       if (need == 0)
          return false;
-      if (need == ENQ_BO_PENDING) {
-         kfifo_flush_batch();
-         need = bo_last_job[handle];
-      }
+      /* Still queued in our unsent batch: definitely busy, no need to break the batch or trap! */
+      if (need == ENQ_BO_PENDING)
+         return true;
       if (need <= __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
          return false;
-      kfifo_wait(0, true);
+      /* Rate-limit non-blocking kernel polls during Mesa's BO cache scans (once per 200 us). */
+      if (now_ns() - kfifo_poll_ns >= 200000ull)
+         kfifo_wait(0, true);
       return need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE);
    }
    if (!async_on)
@@ -975,7 +1030,11 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
       uint64_t in = surface_id, out[9] = {0};
       uint32_t kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       if (kr != 0 || !out[0] || out[0] > MAX_BOS) {
-         if (purge_evictable(0, false) > 0)
+         unsigned df = defer_free_reap(false);
+         unsigned p = purge_evictable(0, false);
+         if (df == 0 && p == 0 && defer_free_n > 0)
+            df += defer_free_reap(true);
+         if (df > 0 || p > 0)
             kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       }
       if (kr == 0 && out[0] && out[0] <= MAX_BOS) {
