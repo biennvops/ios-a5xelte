@@ -1233,7 +1233,7 @@ af_go(int device, struct af *af, uint32_t target)
 	 * (written at a frame's end, the next one's exposure has begun): one frame let go by before a
 	 * measurement, none on the way.
 	 */
-	af->wait = af->at == af->target ? 1 : 0;
+	af->wait = af->at == af->target ? 2 : 0;
 	af->steps++;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
@@ -1251,6 +1251,9 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	}
 	if (af->at == 0 && af->target == 0) {
 		af->at = af->target = f->focus;         /* (where the kernel put it) */
+	}
+	if (f->focus != af->at) {
+		return;                                 /* async buffer is still from before the lens moved */
 	}
 	if (af->wait > 0) {
 		af->wait--;
@@ -1384,8 +1387,9 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	}
 }
 
-static int cam_cfg_bayer = -1;  /* -1 = use kernel f->bayer (0=RGGB rear IMX260, 2=GBRG front S5K4E6); overridable via cam.cfg */
+static int cam_cfg_bayer = -1;  /* -1 = use kernel f->bayer (1=GRBG rear IMX260, 2=GBRG front S5K4E6); overridable via cam.cfg */
 static int cam_cfg_turned = -1; /* -1 = use camera->turned, 0/1 = override */
+static int cam_cfg_focus = -1;  /* -1 = auto AF, 0..1023 = fixed manual focus position */
 static float cam_cfg_sat = 0.6f;
 
 static void
@@ -1393,6 +1397,7 @@ load_cam_cfg(void)
 {
 	cam_cfg_bayer = -1;
 	cam_cfg_turned = -1;
+	cam_cfg_focus = -1;
 	cam_cfg_sat = 0.6f;
 	FILE *f = fopen("/private/var/herolte/cam.cfg", "r");
 	if (f == NULL) {
@@ -1406,6 +1411,8 @@ load_cam_cfg(void)
 			cam_cfg_bayer = iv;
 		} else if (sscanf(line, "turned=%d", &iv) == 1 && iv >= -1 && iv <= 1) {
 			cam_cfg_turned = iv;
+		} else if (sscanf(line, "focus=%d", &iv) == 1 && iv >= -1 && iv <= 1023) {
+			cam_cfg_focus = iv;
 		} else if (sscanf(line, "sat=%f", &fv) == 1 && fv >= 0.0f && fv <= 2.0f) {
 			cam_cfg_sat = fv;
 		}
@@ -1625,14 +1632,22 @@ worker(void *context)
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}
-		if (s->af_now) {
-			s->af_now = false;
-			/* (whatever it was doing: at once, from the next frame) */
-			af.state = AF_STEADY;
-			af.now = true;
-			af.sweep = true;
+		if (cam_cfg_focus >= 0) {
+			if ((uint32_t)cam_cfg_focus != af.at && f->focus != HAKIOS_CAMERA_NO_FOCUS) {
+				struct hakios_camera_command fc = { .command = HAKIOS_CAMERA_FOCUS, .a = (uint32_t)cam_cfg_focus };
+				(void)write(device, &fc, sizeof(fc));
+				af.at = af.target = (uint32_t)cam_cfg_focus;
+			}
+		} else {
+			if (s->af_now) {
+				s->af_now = false;
+				/* (whatever it was doing: at once, from the next frame) */
+				af.state = AF_STEADY;
+				af.now = true;
+				af.sweep = true;
+			}
+			af_frame(device, &af, f, raw, s->af_window, s->af_locked);
 		}
-		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
 		s->frames++;
 
 		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
@@ -1693,16 +1708,18 @@ worker(void *context)
 			w_since += last_end ? (t_end - last_end) * k : 0;
 			last_end = t_end;
 			if (s->frames % 30 == 0) {
+				load_cam_cfg();
 				static uint32_t prev_hwf;
 				uint32_t hwf = f->reserved[2];
 				uint32_t dhw = hwf - prev_hwf;
 				prev_hwf = hwf;
 				FILE *tf = fopen("/private/var/herolte/cam.timing", "w");
 				if (tf) {
-					fprintf(tf, "%ux%u fmt=%u: %.1f ms (%.1f fps): read %.1f, measure %.1f, give %.1f | hwf+%u (%.1f hwfps) exp=%u gain=%.1fx wb=%.2f/%.2f\n",
+					fprintf(tf, "%ux%u fmt=%u: %.1f ms (%.1f fps): read %.1f, measure %.1f, give %.1f | hwf+%u (%.1f hwfps) exp=%u gain=%.1fx wb=%.2f/%.2f focus=%u af=%u(st=%d sh=%.3f)\n",
 					    f->width, f->height, f->format, w_since / 30, w_since > 0 ? 30000 / w_since : 0,
 					    w_read / 30, w_isp / 30, w_give / 30, dhw, w_since > 0 ? (dhw * 1000.0) / w_since : 0,
-					    f->exposure_lines, (double)f->gain / f->gain_unity, isp.wb[0], isp.wb[2]);
+					    f->exposure_lines, (double)f->gain / f->gain_unity, isp.wb[0], isp.wb[2],
+					    f->focus, af.at, af.state, af.sharpness);
 					fclose(tf);
 				}
 				say("timing, a frame on average over 30: %.1f ms in all (%.1f fps): read %.1f, measure %.1f, give %.1f",
