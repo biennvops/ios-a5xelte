@@ -1196,9 +1196,9 @@ colour_temperature(const struct isp *isp)
  * of the curve.
  */
 enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
-#define AF_NEAR         0               /* AK7371 range start (0..1020) */
-#define AF_FAR          1020            /* AK7371 range end */
-#define AF_STEP         60
+#define AF_NEAR         220             /* AK7371 infinity stop (~240..340 is far/infinity on S7 Edge IMX260) */
+#define AF_FAR          880             /* AK7371 macro end */
+#define AF_STEP         55
 #define AF_FINE         15
 
 struct af {
@@ -1270,12 +1270,12 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	af->measured = 0;
 	switch (af->state) {
 	case AF_WATCH:
-		if (locked || (af->sharpness > 0 && sharpness > af->sharpness * 0.6f && level > af->level * 0.7f &&
-		    level < af->level * 1.4f)) {
+		if (locked || (af->sharpness > 0 && sharpness > af->sharpness * 0.45f && level > af->level * 0.55f &&
+		    level < af->level * 1.75f)) {
 			af->unlike = 0;
 			return;
 		}
-		if (af->sharpness > 0 && ++af->unlike < 25) {
+		if (af->sharpness > 0 && ++af->unlike < 45) {
 			return;
 		}
 		af->state = AF_STEADY;
@@ -1359,9 +1359,12 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		if (sharpness > af->best_sharpness) {
 			af->best = af->at;
 			af->best_sharpness = sharpness;
+			af->worse = 0;
+		} else if (af->best_sharpness > 0 && sharpness < af->best_sharpness * 0.65f) {
+			af->worse++;
 		}
 		int next = (int)af->at + af->way * AF_STEP;
-		if (next >= AF_NEAR && next <= AF_FAR) {
+		if (af->worse < 3 && next >= AF_NEAR && next <= AF_FAR) {
 			af_go(device, af, (uint32_t)next);
 			return;
 		}
