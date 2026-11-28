@@ -73,6 +73,9 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <mach-o/dyld.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include "hakios.gl.h"
 
@@ -736,7 +739,38 @@ static uint64_t
 rows_sum(const uint8_t *base, size_t row, size_t used, GLsizei height, unsigned phase, GLsizei step)
 {
 	uint64_t sum = used ^ phase, word;
+#if defined(__aarch64__)
+	uint64x2_t acc0 = vdupq_n_u64(sum);
+	uint64x2_t acc1 = vdupq_n_u64(sum ^ 0x9e3779b97f4a7c15ull);
+	uint64x2_t acc2 = vdupq_n_u64(sum ^ 0xbf58476d1ce4e5b9ull);
+	uint64x2_t acc3 = vdupq_n_u64(sum ^ 0x94d049bb133111ebull);
 
+	for (GLsizei y = (GLsizei)phase; y < height; y += step) {
+		const uint8_t *line = base + row * (size_t)y;
+		size_t at = 0;
+		for (; at + 64 <= used; at += 64) {
+			uint64x2_t v0 = vld1q_u64((const uint64_t *)(line + at));
+			uint64x2_t v1 = vld1q_u64((const uint64_t *)(line + at + 16));
+			uint64x2_t v2 = vld1q_u64((const uint64_t *)(line + at + 32));
+			uint64x2_t v3 = vld1q_u64((const uint64_t *)(line + at + 48));
+			acc0 = vaddq_u64(veorq_u64(acc0, v0), v1);
+			acc1 = vaddq_u64(veorq_u64(acc1, v1), v2);
+			acc2 = vaddq_u64(veorq_u64(acc2, v2), v3);
+			acc3 = vaddq_u64(veorq_u64(acc3, v3), v0);
+		}
+		for (; at + 8 <= used; at += 8) {
+			memcpy(&word, line + at, 8);
+			sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+			sum ^= sum >> 29;
+		}
+	}
+	uint64x2_t f0 = veorq_u64(acc0, vshlq_n_u64(acc1, 1));
+	uint64x2_t f1 = veorq_u64(acc2, vshlq_n_u64(acc3, 2));
+	uint64x2_t f = vaddq_u64(f0, f1);
+	sum ^= vgetq_lane_u64(f, 0) * 0x9e3779b97f4a7c15ull;
+	sum ^= vgetq_lane_u64(f, 1) * 0xbf58476d1ce4e5b9ull;
+	sum ^= sum >> 29;
+#else
 	for (GLsizei y = (GLsizei)phase; y < height; y += step) {
 		const uint8_t *line = base + row * (size_t)y;
 		for (size_t at = 0; at + 8 <= used; at += 8) {
@@ -745,6 +779,7 @@ rows_sum(const uint8_t *base, size_t row, size_t used, GLsizei height, unsigned 
 			sum ^= sum >> 29;
 		}
 	}
+#endif
 	return sum;
 }
 
@@ -1464,6 +1499,8 @@ drawing(struct eagl *e)
  */
 static unsigned shared_cleans;
 
+extern int herodrm_surface_clean(uint32_t surface_id);
+
 static void
 shared_picture_fresh(struct eagl *e, struct image *image)
 {
@@ -1472,7 +1509,7 @@ shared_picture_fresh(struct eagl *e, struct image *image)
 	if (seed == image->seed && e->frames - image->cleaned < 30) {
 		return;
 	}
-	hakios_gl_surface_written(e->gl, IOSurfaceGetID(image->surface));
+	herodrm_surface_clean(IOSurfaceGetID(image->surface));
 	if (shared_cleans++ < 20) {
 		say("hakios-gl: texture %u is surface %u's memory, drawn into elsewhere (seed %u, was %u): its caches cleaned for "
 		    "the GPU\n", image->texture, IOSurfaceGetID(image->surface), seed, image->seed);

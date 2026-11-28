@@ -1022,6 +1022,27 @@ herodrm_bo_sync(uint32_t handle)
    return kr ? fail(EINVAL) : 0;
 }
 
+/* Clean CPU D-cache over an imported input IOSurface for the GPU WITHOUT stalling the Mali pipeline. */
+EXPORT int
+herodrm_surface_clean(uint32_t surface_id)
+{
+   if (!surface_id)
+      return 0;
+   pthread_mutex_lock(&lock);
+   uint64_t in = 0;
+   for (int i = 0; i < MAX_PRIME; i++) {
+      if (primes[i].handle && primes[i].surface_id == surface_id) {
+         struct hbo *bo = lookup(primes[i].handle);
+         if (bo)
+            in = bo->khandle;
+         break;
+      }
+   }
+   uint32_t kr = (conn && in) ? call(SEL_SYNC_BO, &in, 1, NULL, 0) : 0;
+   pthread_mutex_unlock(&lock);
+   return kr ? fail(EINVAL) : 0;
+}
+
 /* Release the kernel GPU VA + SweetSurface ref for an imported IOSurface whose GL texture was deleted. */
 EXPORT void
 herodrm_surface_forget(uint32_t surface_id)
