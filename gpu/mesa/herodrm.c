@@ -271,6 +271,12 @@ heap_cap(void)
 static bool async_on, kfifo_on, kfifo_batch_on;
 static uint64_t kfifo_done, kfifo_gpu_us, kfifo_seq, kfifo_poll_ns;
 static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
+#define MAX_SYNCOBJ 4096
+static bool     syncobj_used[MAX_SYNCOBJ + 1];
+static uint64_t syncobj_seq[MAX_SYNCOBJ + 1];
+static uint8_t  enq_sync_job[MAX_SYNCOBJ + 1];
+static uint32_t enq_syncs[64];
+static unsigned enq_nsyncs;
 static void queue_drain(void);
 static void kfifo_flush_batch(void);
 static bool bo_busy(uint32_t handle);
@@ -665,6 +671,12 @@ kfifo_flush_batch(void)
          bo_last_job[h] = base_seq + enq_bo_job[h];
    }
    enq_nbos = 0;
+   for (unsigned i = 0; i < enq_nsyncs; i++) {
+      uint32_t sh = enq_syncs[i];
+      if (sh && sh <= MAX_SYNCOBJ && syncobj_seq[sh] == ENQ_BO_PENDING)
+         syncobj_seq[sh] = base_seq + enq_sync_job[sh];
+   }
+   enq_nsyncs = 0;
    for (unsigned i = 0; i < defer_free_n; i++) {
       if (defer_free[i].need_seq == ENQ_BO_PENDING)
          defer_free[i].need_seq = real_seq;
@@ -826,7 +838,15 @@ submit(struct drm_panfrost_submit *s)
             enq_bo_job[h] = job_idx;
          }
       }
-      if (enq_n >= ENQ_BATCH_MAX || enq_nbos >= 480)
+      if (s->out_sync && s->out_sync <= MAX_SYNCOBJ) {
+         if (syncobj_seq[s->out_sync] != ENQ_BO_PENDING) {
+            if (enq_nsyncs < 64)
+               enq_syncs[enq_nsyncs++] = s->out_sync;
+            syncobj_seq[s->out_sync] = ENQ_BO_PENDING;
+         }
+         enq_sync_job[s->out_sync] = job_idx;
+      }
+      if (enq_n >= ENQ_BATCH_MAX || enq_nbos >= 480 || enq_nsyncs >= 60)
          kfifo_flush_batch();
       return 0;
    }
@@ -852,6 +872,8 @@ submit(struct drm_panfrost_submit *s)
       for (uint32_t i = 0; i < s->bo_handle_count; i++)
          if (handles[i] && handles[i] <= MAX_BOS)
             bo_last_job[handles[i]] = seq;
+      if (s->out_sync && s->out_sync <= MAX_SYNCOBJ)
+         syncobj_seq[s->out_sync] = seq;
       return 0;
    }
    if (!async_on)
@@ -1191,23 +1213,38 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
    return r;
 }
 
-/* Syncobjs: submits are synchronous, so every syncobj is signaled. */
-static uint32_t next_syncobj = 1;
-
+/* Syncobjs: track exact kernel GPU FIFO seq signaled by each syncobj's out_sync submit. */
 EXPORT int
 drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 {
    (void)fd; (void)flags;
    pthread_mutex_lock(&lock);
-   *handle = next_syncobj++;
+   uint32_t h = 0;
+   for (uint32_t i = 1; i <= MAX_SYNCOBJ; i++) {
+      if (!syncobj_used[i]) {
+         h = i;
+         syncobj_used[i] = true;
+         syncobj_seq[i] = 0;
+         break;
+      }
+   }
    pthread_mutex_unlock(&lock);
+   if (!h)
+      return fail(ENOMEM);
+   *handle = h;
    return 0;
 }
 
 EXPORT int
 drmSyncobjDestroy(int fd, uint32_t handle)
 {
-   (void)fd; (void)handle;
+   (void)fd;
+   pthread_mutex_lock(&lock);
+   if (handle && handle <= MAX_SYNCOBJ) {
+      syncobj_used[handle] = false;
+      syncobj_seq[handle] = 0;
+   }
+   pthread_mutex_unlock(&lock);
    return 0;
 }
 
@@ -1215,19 +1252,67 @@ EXPORT int
 drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
                unsigned flags, uint32_t *first_signaled)
 {
-   (void)fd; (void)handles; (void)num_handles; (void)flags;
+   (void)fd;
    pthread_mutex_lock(&lock);
-   kfifo_flush_batch();
    if (kfifo_on) {
+      bool wait_all = (flags & 1u) != 0; /* DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL */
+      bool any_pending = false;
+      for (unsigned i = 0; i < num_handles; i++) {
+         uint32_t h = handles[i];
+         if (h && h <= MAX_SYNCOBJ && syncobj_seq[h] == ENQ_BO_PENDING) {
+            any_pending = true;
+            break;
+         }
+      }
+      if (any_pending)
+         kfifo_flush_batch();
+
+      uint64_t need = 0;
+      uint32_t first_idx = 0;
+      bool have_any = false;
+      for (unsigned i = 0; i < num_handles; i++) {
+         uint32_t h = handles[i];
+         uint64_t s = (h && h <= MAX_SYNCOBJ) ? syncobj_seq[h] : 0;
+         if (s == ENQ_BO_PENDING)
+            s = kfifo_seq;
+         if (wait_all) {
+            if (s > need)
+               need = s;
+         } else {
+            if (!have_any || s < need) {
+               need = s;
+               first_idx = i;
+               have_any = true;
+            }
+         }
+      }
+
+      /* Fast path: syncobj already signaled (0 syscalls, 0 GPU stall!). */
+      if (need == 0 || need <= __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE)) {
+         pthread_mutex_unlock(&lock);
+         if (first_signaled)
+            *first_signaled = first_idx;
+         return 0;
+      }
+
       struct timespec ts;
       clock_gettime(CLOCK_MONOTONIC, &ts);
       int64_t now_mono = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
       if (timeout_nsec <= now_mono) {
          pthread_mutex_unlock(&lock);
          if (first_signaled)
-            *first_signaled = 0;
+            *first_signaled = first_idx;
          return 0;
       }
+
+      uint64_t t0 = now_ns();
+      kfifo_wait(need, false);
+      st.w_calls[2]++;
+      st.w_ns[2] += now_ns() - t0;
+      pthread_mutex_unlock(&lock);
+      if (first_signaled)
+         *first_signaled = first_idx;
+      return 0;
    }
    uint64_t t0 = now_ns();
    queue_drain();
@@ -1250,14 +1335,28 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num
 EXPORT int
 drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
 {
-   (void)fd; (void)handles; (void)handle_count;
+   (void)fd;
+   pthread_mutex_lock(&lock);
+   for (uint32_t i = 0; i < handle_count; i++) {
+      uint32_t h = handles[i];
+      if (h && h <= MAX_SYNCOBJ)
+         syncobj_seq[h] = 0;
+   }
+   pthread_mutex_unlock(&lock);
    return 0;
 }
 
 EXPORT int
 drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
 {
-   (void)fd; (void)handles; (void)handle_count;
+   (void)fd;
+   pthread_mutex_lock(&lock);
+   for (uint32_t i = 0; i < handle_count; i++) {
+      uint32_t h = handles[i];
+      if (h && h <= MAX_SYNCOBJ)
+         syncobj_seq[h] = 0;
+   }
+   pthread_mutex_unlock(&lock);
    return 0;
 }
 
@@ -1265,7 +1364,13 @@ EXPORT int
 drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
                    uint64_t src_point, uint32_t flags)
 {
-   (void)fd; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
+   (void)fd; (void)dst_point; (void)src_point; (void)flags;
+   pthread_mutex_lock(&lock);
+   if (src_handle && src_handle <= MAX_SYNCOBJ && syncobj_seq[src_handle] == ENQ_BO_PENDING)
+      kfifo_flush_batch();
+   if (dst_handle && dst_handle <= MAX_SYNCOBJ)
+      syncobj_seq[dst_handle] = (src_handle && src_handle <= MAX_SYNCOBJ) ? syncobj_seq[src_handle] : 0;
+   pthread_mutex_unlock(&lock);
    return 0;
 }
 
