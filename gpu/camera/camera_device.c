@@ -1196,10 +1196,10 @@ colour_temperature(const struct isp *isp)
  * of the curve.
  */
 enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
-#define AF_NEAR         0               /* AK7371 infinity end (0..511 -> 0..1023) */
-#define AF_FAR          960             /* AK7371 macro end */
-#define AF_STEP         48
-#define AF_FINE         12
+#define AF_NEAR         0               /* AK7371 range start (0..1020) */
+#define AF_FAR          1020            /* AK7371 range end */
+#define AF_STEP         60
+#define AF_FINE         15
 
 struct af {
 	int             state;
@@ -1225,15 +1225,10 @@ af_go(int device, struct af *af, uint32_t target)
 	struct hakios_camera_command c = { .command = HAKIOS_CAMERA_FOCUS };
 
 	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
-	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
-	    (af->at - af->target > AF_STEP ? af->at - AF_STEP : af->target);
+	/* AK7371 has closed-loop Hall damping: jump directly to target in one write. */
+	c.a = af->target;
 	af->at = c.a;
-	/*
-	 * The lens settles in a few milliseconds; what is spoilt is the frame being exposed while it moved
-	 * (written at a frame's end, the next one's exposure has begun): one frame let go by before a
-	 * measurement, none on the way.
-	 */
-	af->wait = af->at == af->target ? 2 : 0;
+	af->wait = 1;
 	af->steps++;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
@@ -1280,11 +1275,12 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 			af->unlike = 0;
 			return;
 		}
-		if (af->sharpness > 0 && ++af->unlike < 30) {
+		if (af->sharpness > 0 && ++af->unlike < 25) {
 			return;
 		}
 		af->state = AF_STEADY;
 		af->steady = 0;
+		af->sweep = true; /* full-range sweep so we never get stuck on a defocus plateau */
 		af->last_sharpness = sharpness;
 		af->last_level = level;
 		return;
@@ -1296,18 +1292,24 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		}
 		af->last_sharpness = sharpness;
 		af->last_level = level;
-		if (af->steady < 10 && !af->now) {
+		if (af->steady < 6 && !af->now) {
 			return;
 		}
 		af->now = false;
 		if (af->sweep) {
 			af->sweep = false;
 			af->state = AF_SWEEP;
+			af->best = AF_NEAR;
 			af->best_sharpness = -1;
 			af->worse = 0;
 			af->steps = 0;
-			af->way = af->at - AF_NEAR < AF_FAR - af->at ? 1 : -1;
-			af_go(device, af, af->way > 0 ? AF_NEAR : AF_FAR);     /* (walked there a step at a time) */
+			af->way = af->at - AF_NEAR <= AF_FAR - af->at ? 1 : -1;
+			FILE *lf = fopen("/private/var/herolte/af.log", "w");
+			if (lf) {
+				fprintf(lf, "sweep start at=%u way=%d\n", af->at, af->way);
+				fclose(lf);
+			}
+			af_go(device, af, af->way > 0 ? AF_NEAR : AF_FAR);
 			return;
 		}
 		af->state = AF_CLIMB;
@@ -1348,23 +1350,26 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
 		return;
 	}
-	case AF_SWEEP:
-		say("focus: sweep: %u %.4f", af->at, sharpness);
+	case AF_SWEEP: {
+		FILE *lf = fopen("/private/var/herolte/af.log", "a");
+		if (lf) {
+			fprintf(lf, "pos=%4u sh=%.5f lvl=%.1f\n", af->at, sharpness, level);
+			fclose(lf);
+		}
 		if (sharpness > af->best_sharpness) {
 			af->best = af->at;
 			af->best_sharpness = sharpness;
-			af->worse = 0;
-		} else if (sharpness < af->best_sharpness * 0.85f) {
-			af->worse++;
 		}
-		if (af->worse < 2 && (int)af->at + af->way * AF_STEP >= AF_NEAR && (int)af->at + af->way * AF_STEP <= AF_FAR) {
-			af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
+		int next = (int)af->at + af->way * AF_STEP;
+		if (next >= AF_NEAR && next <= AF_FAR) {
+			af_go(device, af, (uint32_t)next);
 			return;
 		}
 		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		af->fine_to = af->best + 3 * AF_FINE > AF_FAR ? AF_FAR : af->best + 3 * AF_FINE;
+		af_go(device, af, af->best > 3 * AF_FINE + AF_NEAR ? af->best - 3 * AF_FINE : AF_NEAR);
 		return;
+	}
 	case AF_FINE_SEARCH:
 		if (sharpness > af->best_sharpness) {
 			af->best = af->at;
@@ -1377,13 +1382,19 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		af->state = AF_SETTLE;
 		af_go(device, af, af->best);
 		return;
-	case AF_SETTLE:
+	case AF_SETTLE: {
 		af->state = AF_WATCH;
 		af->sharpness = sharpness;
 		af->level = level;
 		af->unlike = 0;
+		FILE *lf = fopen("/private/var/herolte/af.log", "a");
+		if (lf) {
+			fprintf(lf, "LOCKED pos=%u steps=%u sh=%.5f\n", af->at, af->steps, sharpness);
+			fclose(lf);
+		}
 		say("focus: the lens at %u after %u moves (sharpness %.3f)", af->at, af->steps, sharpness);
 		return;
+	}
 	}
 }
 
