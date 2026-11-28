@@ -60,7 +60,6 @@ struct hbo {
    uint64_t va, size;
    uint64_t cpu;
    bool in_use;
-   bool pooled;
    bool evictable;
    bool purged;
 };
@@ -269,57 +268,6 @@ static void kfifo_flush_batch(void);
 static bool bo_busy(uint32_t handle);
 static void bo_wait(uint32_t handle);
 
-#define BO_POOL_MAX       64
-#define BO_POOL_ITEM_MAX  (2u * 1024u * 1024u)
-#define BO_POOL_BYTES_MAX (24u * 1024u * 1024u)
-static uint32_t bo_pool[BO_POOL_MAX];
-static unsigned bo_pool_count;
-static uint64_t bo_pool_bytes;
-
-static void
-bo_pool_flush(void)
-{
-   while (bo_pool_count > 0) {
-      uint32_t h = bo_pool[--bo_pool_count];
-      bo_pool_bytes -= bos[h].size;
-      bo_wait(h);
-      bo_last_job[h] = 0;
-      uint64_t in = bos[h].khandle;
-      call(SEL_FREE, &in, 1, NULL, 0);
-      st.frees++;
-      memset(&bos[h], 0, sizeof(bos[h]));
-   }
-}
-
-static uint32_t
-bo_pool_take(uint64_t page_size)
-{
-   for (unsigned i = 0; i < bo_pool_count; i++) {
-      uint32_t h = bo_pool[i];
-      if (bos[h].size == page_size && !bo_busy(h)) {
-         bo_pool[i] = bo_pool[--bo_pool_count];
-         bo_pool_bytes -= bos[h].size;
-         bos[h].pooled = false;
-         if (!bos[h].cpu) {
-            uint64_t in = bos[h].khandle, out = 0;
-            if (call(SEL_MAP, &in, 1, &out, 1) == 0)
-               bos[h].cpu = out;
-         }
-         if (bos[h].cpu) {
-            memset((void *)(uintptr_t)bos[h].cpu, 0, (size_t)bos[h].size);
-            __asm__ volatile ("dsb sy" ::: "memory");
-            return h;
-         }
-         uint64_t in = bos[h].khandle;
-         call(SEL_FREE, &in, 1, NULL, 0);
-         st.frees++;
-         memset(&bos[h], 0, sizeof(bos[h]));
-         return 0;
-      }
-   }
-   return 0;
-}
-
 static uint32_t
 alloc_uhandle(void)
 {
@@ -345,7 +293,7 @@ purge_evictable(uint64_t target_bytes, bool large_only)
    unsigned purged_n = 0;
    for (uint32_t h = 1; h <= MAX_BOS && evictable_bytes > target_bytes; h++) {
       struct hbo *bo = &bos[h];
-      if (!bo->in_use || bo->pooled || !bo->evictable || bo->purged || !bo->khandle)
+      if (!bo->in_use || !bo->evictable || bo->purged || !bo->khandle)
          continue;
       if (large_only && bo->size < (1024u * 1024u))
          continue;
@@ -373,21 +321,7 @@ create_bo(struct drm_panfrost_create_bo *req)
    uint64_t size = req->size;
    if (req->flags & PANFROST_BO_HEAP && size > heap_cap())
       size = heap_cap();
-   uint64_t aligned = (size + 0xfffull) & ~0xfffull;
-   if (!(req->flags & PANFROST_BO_HEAP) && aligned > 0 && aligned <= BO_POOL_ITEM_MAX) {
-      uint32_t reused = bo_pool_take(aligned);
-      if (reused) {
-         req->handle = reused;
-         req->offset = bos[reused].va;
-         req->size = (uint32_t)bos[reused].size;
-         return 0;
-      }
-   }
    uint32_t u = alloc_uhandle();
-   if (!u && bo_pool_count > 0) {
-      bo_pool_flush();
-      u = alloc_uhandle();
-   }
    if (!u) {
       herodrm_log("CREATE_BO: userspace BO handle table full");
       return fail(ENOMEM);
@@ -396,17 +330,14 @@ create_bo(struct drm_panfrost_create_bo *req)
    uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
    if (kr || out[0] == 0 || out[0] > MAX_BOS) {
-      bool flushed = bo_pool_count > 0;
-      if (flushed)
-         bo_pool_flush();
       unsigned p = purge_evictable(0, false);
       if (p == 0 && evictable_bytes > 0) {
          queue_drain();
          p = purge_evictable(0, false);
       }
-      if (p > 0 || flushed) {
+      if (p > 0) {
          kr = call(SEL_CREATE, &in, 1, out, 3);
-         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS && p > 0)
+         if (kr == 0 && out[0] > 0 && out[0] <= MAX_BOS)
             herodrm_log("CREATE_BO %llu B recovered after purging %u cached BOs", (unsigned long long)size, p);
       }
    }
@@ -434,14 +365,14 @@ create_bo(struct drm_panfrost_create_bo *req)
 static struct hbo *
 lookup(uint32_t handle)
 {
-   return handle && handle <= MAX_BOS && bos[handle].in_use && !bos[handle].pooled && !bos[handle].purged && bos[handle].va
+   return handle && handle <= MAX_BOS && bos[handle].in_use && !bos[handle].purged && bos[handle].va
           ? &bos[handle] : NULL;
 }
 
 static int
 free_bo(uint32_t handle)
 {
-   if (!handle || handle > MAX_BOS || !bos[handle].in_use || bos[handle].pooled)
+   if (!handle || handle > MAX_BOS || !bos[handle].in_use)
       return fail(EINVAL);
    if (bos[handle].purged) {
       memset(&bos[handle], 0, sizeof(bos[handle]));
@@ -451,21 +382,12 @@ free_bo(uint32_t handle)
       evictable_bytes -= bos[handle].size;
       bos[handle].evictable = false;
    }
-   bool is_prime = false;
    for (int i = 0; i < MAX_PRIME; i++)
       if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
          close(primes[i].fd);
          primes[i].handle = 0;
          primes[i].surface_id = 0;
-         is_prime = true;
       }
-   if (!is_prime && bos[handle].size <= BO_POOL_ITEM_MAX &&
-       bo_pool_count < BO_POOL_MAX && bo_pool_bytes + bos[handle].size <= BO_POOL_BYTES_MAX) {
-      bos[handle].pooled = true;
-      bo_pool[bo_pool_count++] = handle;
-      bo_pool_bytes += bos[handle].size;
-      return 0;
-   }
    bo_wait(handle);
    bo_last_job[handle] = 0;
    uint64_t in = bos[handle].khandle;
@@ -647,8 +569,11 @@ queue_worker(void *arg)
 }
 
 #define ENQ_BATCH_MAX 32
+#define ENQ_BO_PENDING (~0ull)
 static uint64_t enq_pairs[ENQ_BATCH_MAX * 2];
 static unsigned enq_n;
+static uint32_t enq_bos[512];
+static unsigned enq_nbos;
 
 static void
 kfifo_flush_batch(void)
@@ -667,6 +592,7 @@ kfifo_flush_batch(void)
    st.sel_ns[SEL_ENQUEUE_BATCH] += t1 - t0;
    st.submit_ns += t1 - t0;
    enq_n = 0;
+   uint64_t real_seq = (kr == 0 && out[0] != 0) ? out[0] : kfifo_seq;
    if (kr == 0 && out[0] != 0) {
       kfifo_seq = out[0];
       __atomic_store_n(&kfifo_done, out[1], __ATOMIC_RELEASE);
@@ -675,6 +601,12 @@ kfifo_flush_batch(void)
          kfifo_gpu_us = out[2];
       }
    }
+   for (unsigned i = 0; i < enq_nbos; i++) {
+      uint32_t h = enq_bos[i];
+      if (h && h <= MAX_BOS && bo_last_job[h] == ENQ_BO_PENDING)
+         bo_last_job[h] = real_seq;
+   }
+   enq_nbos = 0;
    stats_tick(t1);
 }
 
@@ -723,7 +655,13 @@ bo_busy(uint32_t handle)
       return false;
    if (kfifo_on) {
       uint64_t need = bo_last_job[handle];
-      if (need == 0 || need <= __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
+      if (need == 0)
+         return false;
+      if (need == ENQ_BO_PENDING) {
+         kfifo_flush_batch();
+         need = bo_last_job[handle];
+      }
+      if (need <= __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
          return false;
       kfifo_wait(0, true);
       return need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE);
@@ -743,8 +681,12 @@ bo_wait(uint32_t handle)
       return;
    if (kfifo_on) {
       uint64_t need = bo_last_job[handle];
+      if (need == ENQ_BO_PENDING) {
+         kfifo_flush_batch();
+         need = bo_last_job[handle];
+      }
       if (need > __atomic_load_n(&kfifo_done, __ATOMIC_ACQUIRE))
-         kfifo_wait(need, false);
+         kfifo_wait(need == ENQ_BO_PENDING ? 0 : need, false);
       return;
    }
    if (!async_on)
@@ -790,17 +732,25 @@ submit(struct drm_panfrost_submit *s)
                   async_on ? "queued + batched (HERO_ASYNC=1)" : "synchronous (HERO_ASYNC=0)");
    }
    if (kfifo_batch_on) {
+      if (s->jc == 0)
+         return 0;
       enq_pairs[2 * enq_n] = s->jc;
       enq_pairs[2 * enq_n + 1] = js;
       enq_n++;
-      uint64_t seq = ++kfifo_seq;
       submits++;
       st.submits++;
       const uint32_t *handles = (const uint32_t *)(uintptr_t)s->bo_handles;
-      for (uint32_t i = 0; i < s->bo_handle_count; i++)
-         if (handles[i] && handles[i] <= MAX_BOS)
-            bo_last_job[handles[i]] = seq;
-      if (enq_n >= ENQ_BATCH_MAX)
+      for (uint32_t i = 0; i < s->bo_handle_count; i++) {
+         uint32_t h = handles[i];
+         if (h && h <= MAX_BOS) {
+            if (bo_last_job[h] != ENQ_BO_PENDING) {
+               if (enq_nbos < 512)
+                  enq_bos[enq_nbos++] = h;
+               bo_last_job[h] = ENQ_BO_PENDING;
+            }
+         }
+      }
+      if (enq_n >= ENQ_BATCH_MAX || enq_nbos >= 480)
          kfifo_flush_batch();
       return 0;
    }
@@ -915,7 +865,7 @@ drmIoctl(int fd, unsigned long request, void *arg)
       break;
    case DRM_IOCTL_PANFROST_MADVISE: {
       struct drm_panfrost_madvise *m = arg;
-      if (!m->handle || m->handle > MAX_BOS || !bos[m->handle].in_use || bos[m->handle].pooled) {
+      if (!m->handle || m->handle > MAX_BOS || !bos[m->handle].in_use) {
          r = fail(EINVAL);
          break;
       }
@@ -1025,8 +975,6 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
       uint64_t in = surface_id, out[9] = {0};
       uint32_t kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       if (kr != 0 || !out[0] || out[0] > MAX_BOS) {
-         if (bo_pool_count > 0)
-            bo_pool_flush();
          if (purge_evictable(0, false) > 0)
             kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
       }
@@ -1036,10 +984,6 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
             if (!primes[i].handle)
                slot = i;
          uint32_t u = alloc_uhandle();
-         if (!u && bo_pool_count > 0) {
-            bo_pool_flush();
-            u = alloc_uhandle();
-         }
          int fd = (slot >= 0 && u != 0) ? open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
          if (fd >= 0) {
             bos[u] = (struct hbo){ .khandle = (uint32_t)out[0], .va = out[1], .size = out[2], .in_use = true };
@@ -1168,17 +1112,21 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_
                unsigned flags, uint32_t *first_signaled)
 {
    (void)fd; (void)handles; (void)num_handles; (void)flags;
+   pthread_mutex_lock(&lock);
+   kfifo_flush_batch();
    if (kfifo_on) {
       struct timespec ts;
       clock_gettime(CLOCK_MONOTONIC, &ts);
       int64_t now_mono = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
       if (timeout_nsec <= now_mono) {
+         pthread_mutex_unlock(&lock);
          if (first_signaled)
             *first_signaled = 0;
          return 0;
       }
    }
    queue_drain();
+   pthread_mutex_unlock(&lock);
    if (first_signaled)
       *first_signaled = 0;
    return 0;

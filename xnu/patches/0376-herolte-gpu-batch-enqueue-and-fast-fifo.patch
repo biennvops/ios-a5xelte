@@ -14,8 +14,7 @@ index 2ae9f4f..13acd2b 100644
   * 0: before and after every job, as Linux's panfrost. 1 (default): only after, as a job begun finds it clean already.
   * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
   */
--static uint32_t hg_flush_mode = 1;
-+static uint32_t hg_flush_mode = 2;
+ static uint32_t hg_flush_mode = 1;
 +static uint32_t hg_shader_mask;
  /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
  static uint64_t hg_job_va = HG_TEST_VA;
